@@ -673,8 +673,8 @@ def test_r2_blank_reads_unallocate_one_run_and_bill_the_rest(tmp_path, capsys):
 
 
 
-NOT_ENTERED = "linked folder(s) not entered (a loop, a folder inside the results, or a folder that holds the results " \
-    "or another linked folder): "
+NOT_ENTERED = "linked folder(s) not entered (a loop, a folder inside the results, a folder that holds the results " \
+    "or another linked folder, or a link out of a linked folder): "
 
 
 def _r3_one_sample(tmp_path, ledger):
@@ -991,3 +991,61 @@ def test_r6_sacct_without_jobid_is_refused(tmp_path):
     sacct = write(tmp_path / "s.txt", "JobIDRaw|State|Elapsed|AllocCPUS|ReqMem\n301|COMPLETED|01:00:00|4|8G\n")
     with pytest.raises(slurm.FormatError, match="needs a JobID column"):
         slurm.read_sacct(sacct)
+
+
+def test_r6_a_staged_link_in_a_linked_work_folder_does_not_stop_a_sample(tmp_path, ledger):
+    # Following "work" finds a task's staged link into A's store; only links in the results folder count as targets.
+    _r3_one_sample(tmp_path, ledger)
+    store = tmp_path / "ext" / "A"
+    write(store / "quant" / "quant.sf", "quant A")
+    work = tmp_path / "ext" / "work"
+    write(work / "ab" / "log.txt", "other task")
+    (work / "ab" / "staged").symlink_to(store / "quant")
+    out = tmp_path / "o"
+    (out / "A_quant").symlink_to(store)
+    (out / "work").symlink_to(work)
+    reg = ingest.register_run(ledger, "R1", "p", out, ["A"], commit=COMMIT)
+    rows = ledger.query("SELECT path, sample_id FROM results ORDER BY path")
+    assert [tuple(r) for r in rows] == [("A.txt", "A"), ("A_quant/quant/quant.sf", "A"), ("work/ab/log.txt", None)]
+    assert "1 linked folder(s) not entered" in " ".join(reg.notes)
+
+
+def test_r6_a_link_out_of_a_linked_folder_is_not_entered(tmp_path, ledger):
+    _r3_one_sample(tmp_path, ledger)
+    store = tmp_path / "ext" / "A"
+    write(store / "a.txt", "a")
+    write(tmp_path / "ext" / "other" / "b.txt", "another task's input")
+    (store / "input").symlink_to(tmp_path / "ext" / "other")
+    out = tmp_path / "o"
+    (out / "A_store").symlink_to(store)
+    ingest.register_run(ledger, "R1", "p", out, ["A"], commit=COMMIT)
+    paths = [r[0] for r in ledger.query("SELECT path FROM results ORDER BY path")]
+    assert paths == ["A.txt", "A_store/a.txt"]
+
+
+def test_r6_a_blank_size_stops_only_a_job_of_the_run(tmp_path, ledger):
+    _r3_one_sample(tmp_path, ledger)
+    sacct = write(tmp_path / "s.txt", (
+        "JobID|JobIDRaw|State|Elapsed|AllocCPUS|ReqMem\n"
+        "101|101|COMPLETED|01:00:00|4|8G\n"
+        "909|909|CANCELLED|00:00:00||\n"
+    ))
+    trace = write(tmp_path / "t.txt", "native_id\tname\n101\tP (A)\n")
+    ingest.register_run(ledger, "R1", "p", tmp_path / "o", ["A"], commit=COMMIT, sacct=sacct, trace=trace)
+    assert [r[0] for r in ledger.query("SELECT job_id FROM jobs")] == ["101"]
+    ours = write(tmp_path / "t2.txt", "native_id\tname\n909\tP (A)\n")
+    with pytest.raises(slurm.FormatError, match=r"line 3: AllocCPUS is empty"):
+        ingest.register_run(ledger, "R2", "p", tmp_path / "o", ["A"], commit=COMMIT, sacct=sacct, trace=ours)
+    with pytest.raises(slurm.FormatError, match=r"line 3: AllocCPUS is empty"):
+        ingest.register_run(ledger, "R3", "p", tmp_path / "o", ["A"], commit=COMMIT, sacct=sacct,
+                            sacct_run_only=True)
+
+
+def test_r6_a_job_map_job_missing_from_sacct_is_noted(tmp_path, ledger):
+    _r3_one_sample(tmp_path, ledger)
+    sacct = write(tmp_path / "s.txt", "JobID|JobIDRaw|State|Elapsed|AllocCPUS|ReqMem\n"
+                  "101|101|COMPLETED|01:00:00|4|8G\n")
+    job_map = write(tmp_path / "m.csv", "job_id,sample_id\n101,A\n102,A\n")
+    reg = ingest.register_run(ledger, "R1", "p", tmp_path / "o", ["A"], commit=COMMIT, sacct=sacct,
+                              job_map=job_map)
+    assert "1 job map job(s) not found in sacct: 102" in reg.notes

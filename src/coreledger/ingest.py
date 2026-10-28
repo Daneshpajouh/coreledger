@@ -217,50 +217,54 @@ def _walk_results(outdir: Path, exclude: Sequence[str]) -> Tuple[List[Path], Lis
 
     Linked folders are entered (nf-core publishDir mode symlink). A link is not entered when it
     points back to a folder already on the way down, so a loop ends; into the results folder,
-    whose files are recorded under their own paths; or at a folder that holds the results folder
-    or the target of a linked folder that lies outside it, since that folder's other files belong
-    to other tasks. A plain folder is always entered. The walk is repeated with the link targets
-    it found until they settle, so the outcome does not depend on the order of names.
+    whose files are recorded under their own paths; at a folder that holds the results folder
+    or the target of another link in the results folder itself, since that folder's other files
+    belong to other tasks; or, inside a linked folder, out of that folder, since a task's staged
+    inputs belong to other tasks. A plain folder is always entered. Only links in the results
+    folder itself count as targets, so the outcome does not depend on the order of names.
     """
     top = outdir.resolve()
-    anchors: Set[Tuple[Path, Path]] = set()
-    while True:
-        files: List[Path] = []
-        linked: List[str] = []
-        loops: List[str] = []
-        found: Set[Tuple[Path, Path]] = set()
-        above = {outdir: frozenset({top})}
-        for root, dirs, names in os.walk(outdir, followlinks=True):
-            kept = []
-            for d in sorted(dirs):
-                if d in exclude:
+    targets: Set[Path] = set()
+    for root, dirs, _ in os.walk(outdir):
+        dirs[:] = [d for d in dirs if d not in exclude]
+        for d in dirs:
+            here = Path(root, d)
+            if here.is_symlink() and not here.resolve().is_relative_to(top):
+                targets.add(here.resolve())
+    files: List[Path] = []
+    linked: List[str] = []
+    loops: List[str] = []
+    above = {outdir: frozenset({top})}
+    store: Dict[Path, Optional[Path]] = {outdir: None}
+    for root, dirs, names in os.walk(outdir, followlinks=True):
+        kept = []
+        inside = store[Path(root)]
+        for d in sorted(dirs):
+            if d in exclude:
+                continue
+            here = Path(root, d)
+            real = here.resolve()
+            store[here] = inside
+            if here.is_symlink():
+                holds = real != top and top.is_relative_to(real)
+                holds = holds or any(t != real and t.is_relative_to(real) for t in targets)
+                leaves = inside is not None and not real.is_relative_to(inside)
+                if real in above[Path(root)] or real.is_relative_to(top) or holds or leaves:
+                    loops.append(here.relative_to(outdir).as_posix())
                     continue
-                here = Path(root, d)
-                real = here.resolve()
-                if here.is_symlink():
-                    where = Path(root).resolve() / d
-                    holds = real != top and top.is_relative_to(real)
-                    holds = holds or any(
-                        t != real and t.is_relative_to(real) and not w.is_relative_to(real) for w, t in anchors
-                    )
-                    if real in above[Path(root)] or real.is_relative_to(top) or holds:
-                        loops.append(here.relative_to(outdir).as_posix())
-                        continue
-                    found.add((where, real))
-                    linked.append(here.relative_to(outdir).as_posix())
-                above[here] = above[Path(root)] | {real}
-                kept.append(d)
-            dirs[:] = kept
-            for name in sorted(names):
-                p = Path(root) / name
-                if p.is_file():
-                    files.append(p)
-                elif p.is_symlink():
-                    raise InputError(f"{p} is a link that does not point at a file; the result it stood for is gone")
-        if found <= anchors:
-            return files, linked, loops
-        anchors |= found
-
+                linked.append(here.relative_to(outdir).as_posix())
+                if inside is None:
+                    store[here] = real
+            above[here] = above[Path(root)] | {real}
+            kept.append(d)
+        dirs[:] = kept
+        for name in sorted(names):
+            p = Path(root) / name
+            if p.is_file():
+                files.append(p)
+            elif p.is_symlink():
+                raise InputError(f"{p} is a link that does not point at a file; the result it stood for is gone")
+    return files, linked, loops
 
 def register_run(
     ledger: Ledger,
@@ -325,11 +329,13 @@ def register_run(
         reg.notes.append(f"{len(linked_dirs)} linked folder(s) entered: {', '.join(linked_dirs[:5])}")
     if loops:
         reg.notes.append(f"{len(loops)} linked folder(s) not entered (a loop, a folder inside the results, "
-                         f"or a folder that holds the results or another linked folder): {', '.join(loops[:5])}")
+                         "a folder that holds the results or another linked folder, or a link out of a linked "
+                         f"folder): {', '.join(loops[:5])}")
 
     jobs: List[slurm.Job] = []
     tags: Dict[str, str] = {}
     held: List[Tuple[str, str]] = []
+    blank: List[Tuple[str, str, str]] = []
     cached: Set[str] = set()
     mapped: Dict[str, str] = {}
     if job_map is not None:
@@ -338,11 +344,15 @@ def register_run(
                 raise InputError(f"{job_map} line {row['_line']}: sample {row['sample_id']} is not in this run")
             mapped[row["job_id"]] = row["sample_id"]
     if sacct is not None:
-        jobs, notes = slurm.read_sacct(sacct, held)
+        jobs, notes = slurm.read_sacct(sacct, held, blank)
         reg.notes.extend(notes)
     if trace is not None:
         tags = slurm.read_nextflow_trace(trace, cached)
     ours = set(tags) | set(mapped)
+    # A blank size stops the run only on a job it would bill, not on another user's line in a wide export.
+    for shown_id, raw_id, problem in blank:
+        if sacct_run_only or (trace is None and job_map is None) or shown_id in ours or raw_id in ours:
+            raise slurm.FormatError(problem)
     if not sacct_run_only and (trace is not None or job_map is not None):
         # An array task's trace ID may be its JobIDRaw (301) while the range shows the parent (300_[3-10]),
         # and a task not yet started is listed by either ID (300_1 or 301).
@@ -360,11 +370,15 @@ def register_run(
             f"{len(held)} Slurm job(s) of this run have not finished ({', '.join(shown[:5])}); "
             "register the run after they end, so their time is billed"
         )
+    listed = {j.job_id for j in jobs} | {j.alt_id for j in jobs}
     if trace is not None:
-        listed = {j.job_id for j in jobs} | {j.alt_id for j in jobs}
         missing = sorted(set(tags) - listed)
         if sacct is not None and missing:
             reg.notes.append(f"{len(missing)} trace job(s) not found in sacct: {', '.join(missing[:5])}")
+    if job_map is not None:
+        missing = sorted(set(mapped) - listed)
+        if sacct is not None and missing:
+            reg.notes.append(f"{len(missing)} job map job(s) not found in sacct: {', '.join(missing[:5])}")
     if (trace is not None or job_map is not None) and not sacct_run_only:
         # A job in the trace or in the job map is this run's; with both given, either list counts.
         kept = [j for j in jobs if j.job_id in ours or j.alt_id in ours]

@@ -113,12 +113,19 @@ def parse_gpus(tres: str) -> int:
     return plain if plain is not None else typed
 
 
-def read_sacct(path: Path, held: Optional[List[Tuple[str, str]]] = None) -> Tuple[List[Job], List[str]]:
+def read_sacct(
+    path: Path,
+    held: Optional[List[Tuple[str, str]]] = None,
+    blank: Optional[List[Tuple[str, str, str]]] = None,
+) -> Tuple[List[Job], List[str]]:
     """Jobs that have finished, and notes on the lines skipped.
 
     ``held``, if given, collects the shown and raw IDs of lines skipped because they have not
     finished: a job still pending or running (``1001_1``, ``1002``), or an array range whose
     tasks have not started (``1001_[3-10]``, ``1001``).
+    ``blank``, if given, collects the shown and raw IDs and the reason for each finished line with
+    an empty ``AllocCPUS`` or ``ReqMem``, which is then left out instead of stopping the read, so
+    the caller can refuse it only when it is one of its own jobs.
     """
     notes: List[str] = []
     with open(path, newline="") as fh:
@@ -168,9 +175,12 @@ def read_sacct(path: Path, held: Optional[List[Tuple[str, str]]] = None) -> Tupl
                 held.append((shown, job_id))
             continue
         # A blank size would bill the job as free.
-        for need in ("AllocCPUS", "ReqMem"):
-            if not get(need).strip():
-                raise FormatError(f"{path} line {n}: {need} is empty")
+        empty = [need for need in ("AllocCPUS", "ReqMem") if not get(need).strip()]
+        if empty:
+            if blank is None:
+                raise FormatError(f"{path} line {n}: {empty[0]} is empty")
+            blank.append((shown, job_id, f"{path} line {n}: {empty[0]} is empty"))
+            continue
         try:
             cpus = int(get("AllocCPUS"))
             nodes = int(get("NNodes") or 1)
