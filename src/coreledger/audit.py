@@ -111,7 +111,8 @@ def audit(ledger: Ledger, check_files: bool = False) -> List[Finding]:
                 out.append(Finding("GATE_NOT_PASS", prun_id, prun_id, msg))
         if gate_report:
             try:
-                now = json.loads(Path(gate_report).read_text()).get("verdict")
+                loaded = json.loads(Path(gate_report).read_text())
+                now = loaded.get("verdict") if isinstance(loaded, dict) else None
             except (OSError, ValueError):
                 now = None
             if now != verdict:

@@ -25,6 +25,8 @@ TRACE = """task_id\thash\tnative_id\tname\tstatus\texit
 3\tcc/000003\t103\tNFCORE_DEMO:MULTIQC\tCOMPLETED\t0
 """
 
+FINISHED = "".join(line + "\n" for line in SACCT.splitlines() if "RUNNING" not in line)
+
 RATES = {"currency": "CAD", "rates": {"cpu_hour": "0.05", "mem_gib_hour": "0.01"}}
 
 
@@ -210,7 +212,7 @@ def test_register_is_all_or_nothing(tmp_path, core, ledger):
     (tmp_path / "o2").mkdir()
     write(tmp_path / "o2" / "A.txt", "x")
     with pytest.raises(ingest.InputError, match="already recorded"):
-        ingest.register_run(ledger, "R2", "p", tmp_path / "o2", ["A"], sacct=tmp_path / "sacct.txt")
+        ingest.register_run(ledger, "R2", "p", tmp_path / "o2", ["A"], sacct=write(tmp_path / "done.txt", FINISHED))
     assert ledger.query("SELECT prun_id FROM pipeline_runs") == [("R1",)]
     assert ledger.one("SELECT COUNT(*) FROM results WHERE prun_id = 'R2'") == (0,)
 
@@ -280,8 +282,9 @@ def test_bill_reads_split_needs_every_lane(tmp_path, ledger):
     write(tmp_path / "s.txt", "JobIDRaw|Elapsed|AllocCPUS|ReqMem\n1|01:00:00|1|1G\n")
     ingest.register_run(ledger, "R1", "p", tmp_path / "o", ["A", "B"], sacct=tmp_path / "s.txt")
     card = billing.RateCard.load(write(tmp_path / "rates.json", json.dumps(RATES)))
-    with pytest.raises(ValueError, match="no read count"):
-        billing.build_bill(ledger, card)
+    bill = billing.build_bill(ledger, card)
+    assert bill.samples == [] and [j for j, _ in bill.unallocated] == ["1"]
+    assert "no read count" in bill.notes[0]
 
 
 @pytest.mark.parametrize(
@@ -502,7 +505,11 @@ def test_register_notes_jobs_without_trace_or_map(tmp_path, ledger):
     write(tmp_path / "o" / "A.txt", "a")
     sacct = write(tmp_path / "s.txt", "JobIDRaw|Elapsed|AllocCPUS|ReqMem\n1|01:00:00|4|8G\n")
     reg = ingest.register_run(ledger, "R1", "p", tmp_path / "o", ["A"], commit=COMMIT, sacct=sacct)
-    assert reg.notes == ["no --trace or --job-map: every Slurm job is shared across the run's samples"]
+    assert reg.notes == [
+        "no --trace or --job-map: every Slurm job is shared across the run's samples",
+        "no read total for A (no lanes, or a lane without reads); "
+        "this run's shared jobs stay unallocated in a bill split by reads",
+    ]
 
 
 def test_read_split_uses_reads_recorded_at_register(tmp_path, core, ledger):
@@ -544,3 +551,110 @@ def test_cli_exclude_replaces_the_default_and_bill_exits_1_on_unallocated(tmp_pa
     lg.close()
     assert main(["bill", dbp, "--rates", str(tmp_path / "rates.json"), "--outdir", str(tmp_path / "b")]) == 1
     assert "unallocated: job 1" in capsys.readouterr().out
+
+
+# review round 2: Illumina names, vs contrasts, broken links, unfinished jobs, odd gate files, blank reads
+
+
+def test_r2_illumina_name_and_numeric_sample_stay_with_their_sample():
+    assert ingest.sample_for_path("fastq/S1_S1_L001_R1_001.fastq.gz", ["S1", "S10"]) == "S1"
+    assert ingest.sample_for_path("fastqc/KO_REP1_1_fastqc.html", ["KO_REP1", "1"]) == "KO_REP1"
+    assert ingest.sample_for_path("de/KO_REP1-vs-WT_REP1.tsv", ["KO_REP1", "WT_REP1"]) is None
+    assert ingest.sample_for_path("de/KO_REP1.vs.WT_REP1.tsv", ["KO_REP1", "WT_REP1"]) is None
+
+
+def test_r2_broken_link_is_refused(tmp_path, ledger):
+    write(tmp_path / "i.csv", "sample_id,project_id\nA,P1\n")
+    ingest.intake(ledger, tmp_path / "i.csv")
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "A.bam").symlink_to(tmp_path / "work" / "gone.bam")
+    with pytest.raises(ingest.InputError, match="does not point at a file"):
+        ingest.register_run(ledger, "R1", "p", out, ["A"], commit=COMMIT)
+    assert ledger.one("SELECT COUNT(*) FROM pipeline_runs")[0] == 0
+
+
+@pytest.mark.parametrize("state", ["PENDING", "RUNNING"])
+def test_r2_unfinished_jobs_of_the_run_are_refused(tmp_path, ledger, state):
+    write(tmp_path / "i.csv", "sample_id,project_id\nA,P1\n")
+    ingest.intake(ledger, tmp_path / "i.csv")
+    write(tmp_path / "o" / "A.txt", "a")
+    sacct = write(tmp_path / "s.txt", f"JobID|JobIDRaw|State|Elapsed|AllocCPUS|ReqMem\n300_[3-10]|300|{state}|00:00:00|0|4G\n")
+    with pytest.raises(ingest.InputError, match="have not finished"):
+        ingest.register_run(ledger, "R1", "p", tmp_path / "o", ["A"], commit=COMMIT, sacct=sacct)
+    trace = write(tmp_path / "t.txt", "native_id\tname\n300_1\tP (A)\n")
+    with pytest.raises(ingest.InputError, match="have not finished"):
+        ingest.register_run(ledger, "R1", "p", tmp_path / "o", ["A"], commit=COMMIT, sacct=sacct, trace=trace)
+
+
+def test_r2_cancelled_range_and_other_users_running_job_are_not_refused(tmp_path, ledger):
+    write(tmp_path / "i.csv", "sample_id,project_id\nA,P1\n")
+    ingest.intake(ledger, tmp_path / "i.csv")
+    write(tmp_path / "o" / "A.txt", "a")
+    sacct = write(tmp_path / "s.txt", (
+        "JobID|JobIDRaw|State|Elapsed|AllocCPUS|ReqMem\n"
+        "300_[3-10]|300|CANCELLED by 1000|00:00:00|0|4G\n"
+        "300_1|301|COMPLETED|01:00:00|2|4G\n"
+        "999|999|RUNNING|00:10:00|8|4G\n"
+    ))
+    trace = write(tmp_path / "t.txt", "native_id\tname\n300_1\tP (A)\n")
+    reg = ingest.register_run(ledger, "R1", "p", tmp_path / "o", ["A"], commit=COMMIT, sacct=sacct, trace=trace)
+    assert reg.jobs == 1 and reg.jobs_per_sample == 1
+
+
+def test_r2_gate_report_that_is_not_an_object(tmp_path, core, ledger):
+    gate = tmp_path / "gate.json"
+    for text in ("[]", "null"):
+        gate.write_text(text)
+        assert ("GATE_MOVED", str(gate.resolve())) in codes(audit.audit(ledger))
+    write(tmp_path / "i2.csv", "sample_id,project_id\nC,P2\n")
+    ingest.intake(ledger, tmp_path / "i2.csv")
+    write(tmp_path / "o2" / "C.txt", "c")
+    with pytest.raises(ingest.InputError, match="not a JSON object"):
+        ingest.register_run(ledger, "R2", "p", tmp_path / "o2", ["C"], commit=COMMIT, gate=gate)
+
+
+def test_r2_folders_naming_two_samples_are_noted(tmp_path, ledger):
+    write(tmp_path / "i.csv", "sample_id,project_id\nWT_REP1,P1\nKO_REP1,P1\n")
+    ingest.intake(ledger, tmp_path / "i.csv")
+    write(tmp_path / "o" / "WT_REP1" / "KO_REP1" / "quant.sf", "q")
+    write(tmp_path / "o" / "de" / "KO_REP1_vs_WT_REP1.tsv", "d")
+    reg = ingest.register_run(ledger, "R1", "p", tmp_path / "o", ["WT_REP1", "KO_REP1"], commit=COMMIT)
+    assert "1 result(s) in folders that name two samples were recorded for the run: WT_REP1/KO_REP1/quant.sf" in reg.notes
+
+
+def test_r2_contrast_job_tag_is_shared(tmp_path, ledger):
+    write(tmp_path / "i.csv", "sample_id,project_id\nWT_REP1,P1\nKO_REP1,P1\n")
+    ingest.intake(ledger, tmp_path / "i.csv")
+    write(tmp_path / "o" / "x.txt", "x")
+    sacct = write(tmp_path / "s.txt", "JobIDRaw|State|Elapsed|AllocCPUS|ReqMem\n7|COMPLETED|01:00:00|1|1G\n")
+    trace = write(tmp_path / "t.txt", "native_id\tname\n7\tDESEQ2 (KO_REP1_vs_WT_REP1)\n")
+    ingest.register_run(ledger, "R1", "p", tmp_path / "o", ["WT_REP1", "KO_REP1"], commit=COMMIT,
+                        sacct=sacct, trace=trace)
+    assert ledger.one("SELECT sample_id FROM jobs WHERE job_id = '7'") == (None,)
+
+
+def test_r2_blank_reads_unallocate_one_run_and_bill_the_rest(tmp_path, capsys):
+    dbp = str(tmp_path / "c.sqlite")
+    write(tmp_path / "i.csv", "sample_id,project_id\nA,P1\nB,P1\nC,P2\n")
+    write(tmp_path / "l.csv", "sample_id,run_id,lane,reads\nA,RUN1,1,10\nB,RUN1,1,\nC,RUN1,2,5\n")
+    write(tmp_path / "o1" / "x.txt", "x")
+    write(tmp_path / "o2" / "y.txt", "y")
+    write(tmp_path / "s1.txt", "JobIDRaw|Elapsed|AllocCPUS|ReqMem\n1|01:00:00|1|1G\n")
+    write(tmp_path / "s2.txt", "JobIDRaw|Elapsed|AllocCPUS|ReqMem\n2|01:00:00|1|1G\n")
+    write(tmp_path / "rates.json", json.dumps(RATES))
+    assert main(["init", dbp]) == 0
+    assert main(["intake", dbp, str(tmp_path / "i.csv")]) == 0
+    assert main(["sequencing", dbp, str(tmp_path / "l.csv")]) == 0
+    for run, out, sacct, samples in (("R1", "o1", "s1.txt", ["A", "B"]), ("R2", "o2", "s2.txt", ["C"])):
+        args = ["register", dbp, run, "--outdir", str(tmp_path / out), "--pipeline", "p", "--commit", COMMIT,
+                "--sacct", str(tmp_path / sacct)]
+        for s in samples:
+            args += ["--sample", s]
+        assert main(args) == 0
+    assert "no read total for B" in capsys.readouterr().out
+    assert main(["bill", dbp, "--rates", str(tmp_path / "rates.json"), "--outdir", str(tmp_path / "b")]) == 1
+    printed = capsys.readouterr().out
+    assert "unallocated: job 1" in printed and "note: R1: shared jobs unallocated" in printed
+    assert "P2,C," in (tmp_path / "b" / "samples.csv").read_text()
+

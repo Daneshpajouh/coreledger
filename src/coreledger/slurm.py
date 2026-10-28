@@ -5,7 +5,8 @@ no trailing ``|``), as described in the sacct manual (https://slurm.schedmd.com/
 Only allocation lines are kept; step lines such as ``1001.batch`` are skipped, since the
 allocation is what the scheduler holds and what a core pays for. Job array lines that still
 cover a range of tasks (``1001_[3-10]``) are skipped with a note, since each task that ran has
-its own line. A ``REQUEUED`` line is an attempt that held the allocation, so it counts like a
+its own line; a range that was cancelled before it started costs nothing, and any other range
+is tasks still waiting to run. A ``REQUEUED`` line is an attempt that held the allocation, so it counts like a
 ``FAILED`` one.
 
 Columns used: ``JobIDRaw`` or ``JobID`` (one is required), ``Elapsed`` or ``ElapsedRaw``,
@@ -87,8 +88,12 @@ def parse_gpus(tres: str) -> int:
     return plain if plain is not None else typed
 
 
-def read_sacct(path: Path) -> Tuple[List[Job], List[str]]:
-    """Jobs that have finished, and notes on the lines skipped."""
+def read_sacct(path: Path, held: Optional[List[str]] = None) -> Tuple[List[Job], List[str]]:
+    """Jobs that have finished, and notes on the lines skipped.
+
+    ``held``, if given, collects the IDs of lines skipped because they have not finished: a job
+    still pending or running, or an array range whose tasks have not started (``1001_[3-10]``).
+    """
     notes: List[str] = []
     with open(path, newline="") as fh:
         lines = [line.rstrip("\r\n") for line in fh if line.strip()]
@@ -118,12 +123,16 @@ def read_sacct(path: Path) -> Tuple[List[Job], List[str]]:
         shown = get("JobID")
         if "." in job_id or "." in shown:
             continue
+        state = get("State").split(" ")[0]
         if "[" in job_id or "[" in shown:
             notes.append(f"job {shown or job_id} skipped: an array line that covers a range of tasks")
+            if state != "CANCELLED" and held is not None:
+                held.append(shown or job_id)
             continue
-        state = get("State").split(" ")[0]
         if state in NOT_FINISHED:
             notes.append(f"job {job_id} skipped: state {state}")
+            if held is not None:
+                held.append(shown or job_id)
             continue
         try:
             cpus = int(get("AllocCPUS") or 0)

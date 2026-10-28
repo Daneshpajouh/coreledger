@@ -8,7 +8,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from . import slurm
 from .db import Ledger
@@ -140,10 +140,21 @@ def match_sample(text: str, samples: Iterable[str]) -> Optional[str]:
     return best
 
 
+CONTRAST_RE = re.compile(r"(?:^|[._-])vs(?:[._-]|$)", re.I)
+
+
 def other_sample_in(text: str, first: str, samples: Iterable[str]) -> bool:
-    """True if a second sample ID, between separators, follows the leading one (``KO_1_vs_WT_1.tsv``)."""
+    """True if a ``vs`` contrast names a second sample ID, between separators (``KO_1_vs_WT_1.tsv``).
+
+    Without ``vs`` the rest is read as part of the first sample's name, so an Illumina file
+    ``S1_S1_L001_R1_001.fastq.gz`` stays with S1 even when a sample is named ``L001`` or ``1``.
+    """
     rest = text[len(first):]
+    if not CONTRAST_RE.search(rest):
+        return False
     for s in samples:
+        if s == first:
+            continue
         start = 0
         while True:
             i = rest.find(s, start)
@@ -156,19 +167,25 @@ def other_sample_in(text: str, first: str, samples: Iterable[str]) -> bool:
     return False
 
 
+def path_samples(rel: str, samples: Sequence[str]) -> Tuple[Set[str], bool]:
+    """The samples a result path's folders and file name start with, and whether a piece is a contrast."""
+    found = set()
+    contrast = False
+    for part in Path(rel).parts:
+        hit = match_sample(part, samples)
+        if hit:
+            contrast = contrast or other_sample_in(part, hit, samples)
+            found.add(hit)
+    return found, contrast
+
+
 def sample_for_path(rel: str, samples: Sequence[str]) -> Optional[str]:
     """The one sample a result path names, in a folder or the file name; None if none or more than one.
 
     A path piece that names two samples, such as a contrast file ``KO_1_vs_WT_1.tsv``, belongs to neither.
     """
-    found = set()
-    for part in Path(rel).parts:
-        hit = match_sample(part, samples)
-        if hit:
-            if other_sample_in(part, hit, samples):
-                return None
-            found.add(hit)
-    return found.pop() if len(found) == 1 else None
+    found, contrast = path_samples(rel, samples)
+    return found.pop() if len(found) == 1 and not contrast else None
 
 
 @dataclass
@@ -231,6 +248,8 @@ def register_run(
     gate_verdict = gate_cfg = gate_path = None
     if gate is not None:
         report = json.loads(Path(gate).read_text())
+        if not isinstance(report, dict):
+            raise InputError(f"{gate}: the gate report is not a JSON object")
         gate_verdict = report.get("verdict")
         if gate_verdict not in ("PASS", "FAIL", "ERROR"):
             raise InputError(f"{gate}: no verdict PASS, FAIL or ERROR in the gate report")
@@ -246,16 +265,27 @@ def register_run(
             p = Path(root) / name
             if p.is_file():
                 files.append(p)
+            elif p.is_symlink():
+                raise InputError(f"{p} is a link that does not point at a file; the result it stood for is gone")
     if linked_dirs:
         reg.notes.append(f"{len(linked_dirs)} linked folder(s) not entered: {', '.join(linked_dirs[:5])}")
 
     jobs: List[slurm.Job] = []
     tags: Dict[str, str] = {}
+    held: List[str] = []
     if sacct is not None:
-        jobs, notes = slurm.read_sacct(sacct)
+        jobs, notes = slurm.read_sacct(sacct, held)
         reg.notes.extend(notes)
     if trace is not None:
         tags = slurm.read_nextflow_trace(trace)
+        bases = {t.split("_")[0] for t in tags}
+        held = [h for h in held if h.split("_")[0] in bases]
+    if held:
+        raise InputError(
+            f"{len(held)} Slurm job(s) of this run have not finished ({', '.join(held[:5])}); "
+            "register the run after they end, so their time is billed"
+        )
+    if trace is not None:
         kept = [j for j in jobs if j.job_id in tags or j.alt_id in tags]
         if sacct is not None and len(kept) != len(jobs):
             reg.notes.append(f"{len(jobs) - len(kept)} sacct job(s) not in the trace were left out")
@@ -272,6 +302,21 @@ def register_run(
             if row["sample_id"] not in samples:
                 raise InputError(f"{job_map} line {row['_line']}: sample {row['sample_id']} is not in this run")
             mapped[row["job_id"]] = row["sample_id"]
+
+    two = []
+    for p in files:
+        rel = p.relative_to(outdir).as_posix()
+        named, contrast = path_samples(rel, samples)
+        if len(named) > 1 and not contrast:
+            two.append(rel)
+    if two:
+        reg.notes.append(f"{len(two)} result(s) in folders that name two samples were recorded for the run: "
+                         f"{', '.join(two[:5])}")
+    weights = {s: reads_on_record(ledger, s) for s in samples}
+    blank = [s for s in samples if weights[s] is None]
+    if blank and jobs:
+        reg.notes.append(f"no read total for {', '.join(blank[:5])} (no lanes, or a lane without reads); "
+                         "this run's shared jobs stay unallocated in a bill split by reads")
 
     try:
         ledger.execute(
@@ -293,7 +338,7 @@ def register_run(
         )
         ledger.executemany(
             "INSERT INTO prun_samples (prun_id, sample_id, reads) VALUES (?, ?, ?)",
-            [(prun_id, s, reads_on_record(ledger, s)) for s in samples],
+            [(prun_id, s, weights[s]) for s in samples],
         )
         for p in files:
             rel = p.relative_to(outdir).as_posix()
@@ -309,6 +354,8 @@ def register_run(
             if sample is None and tags:
                 tag = tags.get(j.job_id) or tags.get(j.alt_id) or ""
                 sample = match_sample(tag, samples) if tag else None
+                if sample is not None and other_sample_in(tag, sample, samples):
+                    sample = None
             if ledger.one("SELECT prun_id FROM jobs WHERE job_id = ?", (j.job_id,)):
                 raise InputError(f"Slurm job {j.job_id} is already recorded for another pipeline run")
             ledger.execute(

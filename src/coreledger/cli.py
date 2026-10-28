@@ -131,6 +131,8 @@ def cmd_bill(args: argparse.Namespace) -> int:
         print(f"unallocated: job {job_id}, {billing.decimal_text(cost, 6)} {bill.currency} (no samples to charge)")
     for note in bill.skipped:
         print(f"skipped: {note}")
+    for note in bill.notes:
+        print(f"note: {note}")
     return 1 if bill.unallocated else 0
 
 

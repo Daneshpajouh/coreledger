@@ -87,6 +87,7 @@ class Bill:
     project_exact: Dict[str, Fraction]
     unallocated: List[Tuple[str, Fraction]] = field(default_factory=list)
     skipped: List[str] = field(default_factory=list)
+    notes: List[str] = field(default_factory=list)
 
 
 def round_half_up(value: Fraction) -> int:
@@ -170,6 +171,7 @@ def build_bill(
     lines: Dict[str, SampleLine] = {}
     unallocated: List[Tuple[str, Fraction]] = []
     skipped: List[str] = []
+    notes: List[str] = []
     weights_cache: Dict[str, List[Tuple[str, str, Fraction]]] = {}
     members_cache: Dict[str, Set[str]] = {}
     project_of = dict(ledger.query("SELECT sample_id, project_id FROM samples"))
@@ -195,7 +197,11 @@ def build_bill(
             parts = [(project_of[use.sample_id], use.sample_id, Fraction(1))]
         else:
             if use.prun_id not in weights_cache:
-                weights_cache[use.prun_id] = sample_weights(ledger, use.prun_id, split)
+                try:
+                    weights_cache[use.prun_id] = sample_weights(ledger, use.prun_id, split)
+                except ValueError as exc:
+                    weights_cache[use.prun_id] = []
+                    notes.append(f"{use.prun_id}: shared jobs unallocated: {exc}")
             parts = weights_cache[use.prun_id]
         total_w = sum((w for _, _, w in parts), Fraction(0))
         if not parts or total_w == 0:
@@ -218,7 +224,7 @@ def build_bill(
         for sample, c in split_cents(cents, [(s.sample_id, s.exact) for s in members]).items():
             lines[sample].cents = c
     samples = sorted(lines.values(), key=lambda s: (s.project_id, s.sample_id))
-    return Bill(card.currency, samples, dict(sorted(projects.items())), project_exact, unallocated, skipped)
+    return Bill(card.currency, samples, dict(sorted(projects.items())), project_exact, unallocated, skipped, notes)
 
 
 def naive_cents(bill: Bill) -> Dict[str, int]:
