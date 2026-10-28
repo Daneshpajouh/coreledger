@@ -54,6 +54,7 @@ def cmd_register(args: argparse.Namespace) -> int:
         sacct=Path(args.sacct) if args.sacct else None,
         trace=Path(args.trace) if args.trace else None,
         job_map=Path(args.job_map) if args.job_map else None,
+        sacct_run_only=args.sacct_run_only,
         gate=Path(args.gate) if args.gate else None,
         exclude=tuple(args.exclude) if args.exclude is not None else ("pipeline_info",),
     )
@@ -128,7 +129,8 @@ def cmd_bill(args: argparse.Namespace) -> int:
         status = "sample lines add up" if lines == cents else "SAMPLE LINES DO NOT ADD UP"
         print(f"{project}: {billing.money(cents, bill.currency)} ({status})")
     for job_id, cost in bill.unallocated:
-        print(f"unallocated: job {job_id}, {billing.decimal_text(cost, 6)} {bill.currency} (no samples to charge)")
+        print(f"unallocated: job {job_id}, {billing.decimal_text(cost, 6)} {bill.currency} "
+              "(no samples to charge; see the notes below)")
     for note in bill.skipped:
         print(f"skipped: {note}")
     for note in bill.notes:
@@ -186,6 +188,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--sacct", help="sacct --parsable2 output for the run's jobs")
     s.add_argument("--trace", help="Nextflow trace file (maps Slurm jobs to task tags)")
     s.add_argument("--job-map", help="CSV job_id,sample_id for jobs a trace cannot tag")
+    s.add_argument(
+        "--sacct-run-only", action="store_true",
+        help="the sacct file holds this run's jobs alone, so jobs not in a trace or job map are kept and shared",
+    )
     s.add_argument("--gate", help="tolgate JSON report (or any JSON with verdict PASS, FAIL or ERROR)")
     s.add_argument(
         "--exclude", action="append", default=None,
@@ -208,7 +214,10 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("bill", help="cost recovery from the recorded Slurm jobs")
     s.add_argument("db")
     s.add_argument("--rates", required=True, help="rate card JSON")
-    s.add_argument("--split", choices=["reads", "equal"], default="reads", help="how shared jobs are split")
+    s.add_argument(
+        "--split", choices=["reads", "equal"], default="reads",
+        help="how shared jobs are split; reads uses each sample's total when the run was registered",
+    )
     s.add_argument("--prun", action="append", help="only these pipeline runs (repeat)")
     s.add_argument("--outdir", required=True)
     s.set_defaults(func=cmd_bill)
@@ -230,6 +239,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         return args.func(args)
+    except db.integrity_errors() as exc:
+        print(f"coreledger: the catalogue refused the change, so nothing was written: {exc}", file=sys.stderr)
+        return 2
     except (ingest.InputError, ValueError, RuntimeError, OSError) as exc:
         print(f"coreledger: {exc}", file=sys.stderr)
         return 2

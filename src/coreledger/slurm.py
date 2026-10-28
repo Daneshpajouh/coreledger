@@ -5,9 +5,20 @@ no trailing ``|``), as described in the sacct manual (https://slurm.schedmd.com/
 Only allocation lines are kept; step lines such as ``1001.batch`` are skipped, since the
 allocation is what the scheduler holds and what a core pays for. Job array lines that still
 cover a range of tasks (``1001_[3-10]``) are skipped with a note, since each task that ran has
-its own line; a range that was cancelled before it started costs nothing, and any other range
-is tasks still waiting to run. A ``REQUEUED`` line is an attempt that held the allocation, so it counts like a
-``FAILED`` one.
+its own line; a range whose state is one of ``NOT_FINISHED``, or has no state, is tasks still
+waiting to run, and any other range (cancelled before it started, for one) costs nothing. A
+``REQUEUED`` line is an attempt that held the allocation, so it counts like a ``FAILED`` one.
+
+A ``RESIZING`` line is the part of a job before a resize: the manual says "Records left in the
+RESIZING state by a resize operation are also shown by default" and "Duplicate records can result
+from requeues, federation, resizes", so the job goes on under the same ID. Each record of a
+repeated ID is kept as its own job, numbered by ``record`` in file order, and billed for its own
+time and size.
+
+``NOT_FINISHED`` holds the states and flags of a job that can still add time: the states
+``PENDING``, ``RUNNING`` and ``SUSPENDED``, and the flags in the job state codes page
+(https://slurm.schedmd.com/job_state_codes.html) for a job that still holds or waits for an
+allocation, such as ``COMPLETING`` (the epilog may still run) and ``CONFIGURING``.
 
 Columns used: ``JobIDRaw`` or ``JobID`` (one is required), ``Elapsed`` or ``ElapsedRaw``,
 ``AllocCPUS``, ``ReqMem`` (required); ``JobID``, ``JobName``, ``State``, ``NNodes`` and
@@ -22,10 +33,13 @@ import re
 from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 UNITS = {"K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4, "P": 1024**5}
-NOT_FINISHED = {"PENDING", "RUNNING", "RESIZING", "SUSPENDED"}
+NOT_FINISHED = {
+    "PENDING", "RUNNING", "SUSPENDED", "COMPLETING", "CONFIGURING", "POWER_UP_NODE", "REQUEUE_FED",
+    "REQUEUE_HOLD", "RESV_DEL_HOLD", "SIGNALING", "SPECIAL_EXIT", "STAGE_OUT", "STOPPED",
+}
 
 
 class FormatError(ValueError):
@@ -42,6 +56,12 @@ class Job:
     alloc_cpus: int
     req_mem_bytes: int
     gpus: int
+    record: int = 1
+
+    @property
+    def key(self) -> str:
+        """The catalogue key: the Slurm ID, with ``#2`` and on for later records of the same ID."""
+        return self.job_id if self.record == 1 else f"{self.job_id}#{self.record}"
 
 
 def parse_elapsed(text: str) -> int:
@@ -111,6 +131,7 @@ def read_sacct(path: Path, held: Optional[List[str]] = None) -> Tuple[List[Job],
         raise FormatError(f"{path}: needs an Elapsed or ElapsedRaw column")
 
     jobs: List[Job] = []
+    records: Dict[str, int] = {}
     for n, line in enumerate(lines[1:], start=2):
         fields = line.split("|")
         if len(fields) != len(header):
@@ -126,7 +147,7 @@ def read_sacct(path: Path, held: Optional[List[str]] = None) -> Tuple[List[Job],
         state = get("State").split(" ")[0]
         if "[" in job_id or "[" in shown:
             notes.append(f"job {shown or job_id} skipped: an array line that covers a range of tasks")
-            if state != "CANCELLED" and held is not None:
+            if (state in NOT_FINISHED or not state) and held is not None:
                 held.append(shown or job_id)
             continue
         if state in NOT_FINISHED:
@@ -145,16 +166,21 @@ def read_sacct(path: Path, held: Optional[List[str]] = None) -> Tuple[List[Job],
         except (ValueError, FormatError) as exc:
             raise FormatError(f"{path} line {n}: {exc}") from exc
         alt = get("JobID") if id_col == "JobIDRaw" else ""
-        jobs.append(Job(job_id, alt if alt != job_id else "", get("JobName"), state, elapsed, cpus, mem, gpus))
+        records[job_id] = records.get(job_id, 0) + 1
+        jobs.append(Job(
+            job_id, alt if alt != job_id else "", get("JobName"), state, elapsed, cpus, mem, gpus, records[job_id]
+        ))
     return jobs, notes
 
 
-def read_nextflow_trace(path: Path) -> Dict[str, str]:
+def read_nextflow_trace(path: Path, cached: Optional[Set[str]] = None) -> Dict[str, str]:
     """Slurm job ID (``native_id``) to the task tag, from a Nextflow trace file.
 
     The tag is the ``tag`` column when the trace has one, otherwise the text in the last
     pair of parentheses of ``name`` (``NFCORE_RNASEQ:RNASEQ:FASTQC (WT_REP1)``). Tasks
     without a tag map to an empty string. Cached and failed attempts keep their own IDs.
+    ``cached``, if given, collects the IDs of rows whose ``status`` is ``CACHED``: a resumed
+    run's trace repeats them from the first attempt.
     """
     out: Dict[str, str] = {}
     with open(path, newline="") as fh:
@@ -169,6 +195,8 @@ def read_nextflow_trace(path: Path) -> Dict[str, str]:
             if not tag or tag == "-":
                 tag = task_tag(row.get("name") or "") or ""
             out[native] = tag
+            if cached is not None and (row.get("status") or "").strip().upper() == "CACHED":
+                cached.add(native)
     return out
 
 

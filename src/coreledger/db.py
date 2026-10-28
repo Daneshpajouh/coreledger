@@ -137,6 +137,18 @@ def connect(target: str) -> Ledger:
     return Ledger(conn, "sqlite")
 
 
+def integrity_errors() -> Tuple[type, ...]:
+    """The constraint errors of both engines, such as a lane entered twice (psycopg's when it is installed)."""
+    errors: List[type] = [sqlite3.IntegrityError]
+    try:
+        import psycopg
+    except ImportError:
+        pass
+    else:
+        errors.append(psycopg.IntegrityError)
+    return tuple(errors)
+
+
 def init(ledger: Ledger) -> None:
     """Create the tables if they are missing; refuse a catalogue from another schema version."""
     for ddl in TABLES:

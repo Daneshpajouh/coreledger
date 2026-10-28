@@ -156,8 +156,8 @@ def sample_weights(ledger: Ledger, prun_id: str, by: str) -> List[Tuple[str, str
     for project, sample, reads in rows:
         if reads is None:
             raise ValueError(
-                f"sample {sample} had no read count on every lane when {prun_id} was registered, so its shared "
-                "jobs cannot be split by reads; use --split equal"
+                f"sample {sample} had no lanes, or a lane without a read count, when {prun_id} was registered, "
+                "so its shared jobs cannot be split by reads; use --split equal"
             )
         out.append((project, sample, Fraction(int(reads))))
     return out

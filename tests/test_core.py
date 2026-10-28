@@ -212,7 +212,8 @@ def test_register_is_all_or_nothing(tmp_path, core, ledger):
     (tmp_path / "o2").mkdir()
     write(tmp_path / "o2" / "A.txt", "x")
     with pytest.raises(ingest.InputError, match="already recorded"):
-        ingest.register_run(ledger, "R2", "p", tmp_path / "o2", ["A"], sacct=write(tmp_path / "done.txt", FINISHED))
+        ingest.register_run(ledger, "R2", "p", tmp_path / "o2", ["A"], sacct=write(tmp_path / "done.txt", FINISHED),
+                            sacct_run_only=True)
     assert ledger.query("SELECT prun_id FROM pipeline_runs") == [("R1",)]
     assert ledger.one("SELECT COUNT(*) FROM results WHERE prun_id = 'R2'") == (0,)
 
@@ -280,11 +281,11 @@ def test_bill_reads_split_needs_every_lane(tmp_path, ledger):
     ingest.add_sequencing(ledger, tmp_path / "l.csv")
     (tmp_path / "o").mkdir()
     write(tmp_path / "s.txt", "JobIDRaw|Elapsed|AllocCPUS|ReqMem\n1|01:00:00|1|1G\n")
-    ingest.register_run(ledger, "R1", "p", tmp_path / "o", ["A", "B"], sacct=tmp_path / "s.txt")
+    ingest.register_run(ledger, "R1", "p", tmp_path / "o", ["A", "B"], sacct=tmp_path / "s.txt", sacct_run_only=True)
     card = billing.RateCard.load(write(tmp_path / "rates.json", json.dumps(RATES)))
     bill = billing.build_bill(ledger, card)
     assert bill.samples == [] and [j for j, _ in bill.unallocated] == ["1"]
-    assert "no read count" in bill.notes[0]
+    assert "a lane without a read count" in bill.notes[0]
 
 
 @pytest.mark.parametrize(
@@ -465,7 +466,7 @@ def test_reqmem_fraction_is_exact():
     assert slurm.parse_reqmem("0.1G", 1, 1) == round(Fraction(1, 10) * 1024**3)
 
 
-def test_register_keeps_linked_files_and_notes_linked_folders(tmp_path, ledger):
+def test_register_enters_linked_folders(tmp_path, ledger):
     write(tmp_path / "i.csv", "sample_id,project_id\nA,P1\n")
     ingest.intake(ledger, tmp_path / "i.csv")
     store = tmp_path / "work"
@@ -476,8 +477,8 @@ def test_register_keeps_linked_files_and_notes_linked_folders(tmp_path, ledger):
     (out / "align" / "A.bam").symlink_to(store / "A.bam")
     (out / "linked").symlink_to(store / "dir")
     reg = ingest.register_run(ledger, "R1", "p", out, ["A"], commit=COMMIT)
-    assert [r[0] for r in ledger.query("SELECT path FROM results")] == ["align/A.bam"]
-    assert reg.notes == ["1 linked folder(s) not entered: linked"]
+    assert [r[0] for r in ledger.query("SELECT path FROM results ORDER BY path")] == ["align/A.bam", "linked/A.bai"]
+    assert reg.notes == ["1 linked folder(s) entered: linked"]
     assert "NO_RESULTS" not in [f.code for f in audit.audit(ledger)]
 
 
@@ -504,7 +505,8 @@ def test_register_notes_jobs_without_trace_or_map(tmp_path, ledger):
     ingest.intake(ledger, tmp_path / "i.csv")
     write(tmp_path / "o" / "A.txt", "a")
     sacct = write(tmp_path / "s.txt", "JobIDRaw|Elapsed|AllocCPUS|ReqMem\n1|01:00:00|4|8G\n")
-    reg = ingest.register_run(ledger, "R1", "p", tmp_path / "o", ["A"], commit=COMMIT, sacct=sacct)
+    reg = ingest.register_run(ledger, "R1", "p", tmp_path / "o", ["A"], commit=COMMIT, sacct=sacct,
+                              sacct_run_only=True)
     assert reg.notes == [
         "no --trace or --job-map: every Slurm job is shared across the run's samples",
         "no read total for A (no lanes, or a lane without reads); "
@@ -542,7 +544,7 @@ def test_cli_exclude_replaces_the_default_and_bill_exits_1_on_unallocated(tmp_pa
     assert main([
         "register", dbp, "R1", "--outdir", str(tmp_path / "res"), "--pipeline", "p", "--sample", "A",
         "--commit", COMMIT,
-        "--sacct", str(tmp_path / "sacct.txt"), "--exclude", "skip",
+        "--sacct", str(tmp_path / "sacct.txt"), "--sacct-run-only", "--exclude", "skip",
     ]) == 0
     lg = db.connect(dbp)
     assert [r[0] for r in lg.query("SELECT path FROM results")] == ["pipeline_info/t.txt"]
@@ -583,13 +585,13 @@ def test_r2_unfinished_jobs_of_the_run_are_refused(tmp_path, ledger, state):
     head = "JobID|JobIDRaw|State|Elapsed|AllocCPUS|ReqMem\n"
     sacct = write(tmp_path / "s.txt", f"{head}300_[3-10]|300|{state}|00:00:00|0|4G\n")
     with pytest.raises(ingest.InputError, match="have not finished"):
-        ingest.register_run(ledger, "R1", "p", tmp_path / "o", ["A"], commit=COMMIT, sacct=sacct)
+        ingest.register_run(ledger, "R1", "p", tmp_path / "o", ["A"], commit=COMMIT, sacct=sacct, sacct_run_only=True)
     trace = write(tmp_path / "t.txt", "native_id\tname\n300_1\tP (A)\n")
     with pytest.raises(ingest.InputError, match="have not finished"):
         ingest.register_run(ledger, "R1", "p", tmp_path / "o", ["A"], commit=COMMIT, sacct=sacct, trace=trace)
     plain = write(tmp_path / "p.txt", f"{head}7|7|{state}|00:00:00|2|4G\n")
     with pytest.raises(ingest.InputError, match=r"not finished \(7\)"):
-        ingest.register_run(ledger, "R1", "p", tmp_path / "o", ["A"], commit=COMMIT, sacct=plain)
+        ingest.register_run(ledger, "R1", "p", tmp_path / "o", ["A"], commit=COMMIT, sacct=plain, sacct_run_only=True)
 
 
 def test_r2_cancelled_range_and_other_users_running_job_are_not_refused(tmp_path, ledger):
@@ -654,7 +656,7 @@ def test_r2_blank_reads_unallocate_one_run_and_bill_the_rest(tmp_path, capsys):
     assert main(["sequencing", dbp, str(tmp_path / "l.csv")]) == 0
     for run, out, sacct, samples in (("R1", "o1", "s1.txt", ["A", "B"]), ("R2", "o2", "s2.txt", ["C"])):
         args = ["register", dbp, run, "--outdir", str(tmp_path / out), "--pipeline", "p", "--commit", COMMIT,
-                "--sacct", str(tmp_path / sacct)]
+                "--sacct", str(tmp_path / sacct), "--sacct-run-only"]
         for s in samples:
             args += ["--sample", s]
         assert main(args) == 0

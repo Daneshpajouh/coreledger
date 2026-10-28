@@ -228,8 +228,14 @@ def register_run(
     gate: Optional[Path] = None,
     exclude: Sequence[str] = ("pipeline_info",),
     today: Optional[str] = None,
+    sacct_run_only: bool = False,
 ) -> Registered:
-    """Record one pipeline run: its samples, every result file with its hash, its Slurm jobs and its gate."""
+    """Record one pipeline run: its samples, every result file with its hash, its Slurm jobs and its gate.
+
+    Without a trace, an sacct file is taken whole only when ``sacct_run_only`` says it holds this
+    run's jobs alone; otherwise only the jobs in ``job_map`` are kept, and with no job map either
+    the run is refused, since a wide sacct export would bill other people's jobs to this run.
+    """
     _check_id(prun_id, "pipeline run ID", "register")
     if ledger.one("SELECT 1 FROM pipeline_runs WHERE prun_id = ?", (prun_id,)):
         raise InputError(f"pipeline run {prun_id} is already registered")
@@ -243,11 +249,19 @@ def register_run(
         raise InputError(f"not in the catalogue: {', '.join(unknown)}; add them by intake first")
     if commit is not None and not re.fullmatch(r"[0-9a-f]{40}", commit):
         raise InputError(f"commit {commit!r} is not a full 40-character git commit hash")
+    if sacct is not None and trace is None and job_map is None and not sacct_run_only:
+        raise InputError(
+            "sacct without --trace or --job-map would bill every job in the file to this run; "
+            "give one of them, or --sacct-run-only if the file holds this run's jobs alone"
+        )
 
     reg = Registered(prun_id)
     gate_verdict = gate_cfg = gate_path = None
     if gate is not None:
-        report = json.loads(Path(gate).read_text())
+        try:
+            report = json.loads(Path(gate).read_text())
+        except json.JSONDecodeError as exc:
+            raise InputError(f"{gate}: the gate report is not valid JSON ({exc})") from exc
         if not isinstance(report, dict):
             raise InputError(f"{gate}: the gate report is not a JSON object")
         gate_verdict = report.get("verdict")
@@ -258,9 +272,23 @@ def register_run(
 
     files = []
     linked_dirs = []
-    for root, dirs, names in os.walk(outdir):
-        dirs[:] = sorted(d for d in dirs if d not in exclude)
-        linked_dirs.extend(Path(root, d).relative_to(outdir).as_posix() for d in dirs if Path(root, d).is_symlink())
+    twice = []
+    seen = {outdir.resolve()}
+    for root, dirs, names in os.walk(outdir, followlinks=True):
+        kept_dirs = []
+        for d in sorted(dirs):
+            if d in exclude:
+                continue
+            here = Path(root, d)
+            real = here.resolve()
+            if real in seen:
+                twice.append(here.relative_to(outdir).as_posix())
+                continue
+            seen.add(real)
+            kept_dirs.append(d)
+            if here.is_symlink():
+                linked_dirs.append(here.relative_to(outdir).as_posix())
+        dirs[:] = kept_dirs
         for name in sorted(names):
             p = Path(root) / name
             if p.is_file():
@@ -268,17 +296,31 @@ def register_run(
             elif p.is_symlink():
                 raise InputError(f"{p} is a link that does not point at a file; the result it stood for is gone")
     if linked_dirs:
-        reg.notes.append(f"{len(linked_dirs)} linked folder(s) not entered: {', '.join(linked_dirs[:5])}")
+        reg.notes.append(f"{len(linked_dirs)} linked folder(s) entered: {', '.join(linked_dirs[:5])}")
+    if twice:
+        reg.notes.append(f"{len(twice)} folder(s) reached a second time by a link, entered once: "
+                         f"{', '.join(twice[:5])}")
 
     jobs: List[slurm.Job] = []
     tags: Dict[str, str] = {}
     held: List[str] = []
+    cached: Set[str] = set()
+    mapped: Dict[str, str] = {}
+    if job_map is not None:
+        for row in _rows(job_map, ("job_id", "sample_id")):
+            if row["sample_id"] not in samples:
+                raise InputError(f"{job_map} line {row['_line']}: sample {row['sample_id']} is not in this run")
+            mapped[row["job_id"]] = row["sample_id"]
     if sacct is not None:
         jobs, notes = slurm.read_sacct(sacct, held)
         reg.notes.extend(notes)
     if trace is not None:
-        tags = slurm.read_nextflow_trace(trace)
-        bases = {t.split("_")[0] for t in tags}
+        tags = slurm.read_nextflow_trace(trace, cached)
+    ours = set(tags) | set(mapped)
+    if trace is not None or (job_map is not None and not sacct_run_only):
+        # An array task's trace ID may be its JobIDRaw (301) while the range shows the parent (300_[3-10]).
+        bases = {t.split("_")[0] for t in ours}
+        bases |= {i.split("_")[0] for j in jobs if j.job_id in ours or j.alt_id in ours for i in (j.job_id, j.alt_id) if i}
         held = [h for h in held if h.split("_")[0] in bases]
     if held:
         raise InputError(
@@ -294,14 +336,14 @@ def register_run(
         if sacct is not None and missing:
             reg.notes.append(f"{len(missing)} trace job(s) not found in sacct: {', '.join(missing[:5])}")
         jobs = kept
+    elif job_map is not None and not sacct_run_only:
+        kept = [j for j in jobs if j.job_id in mapped or j.alt_id in mapped]
+        if len(kept) != len(jobs):
+            reg.notes.append(f"{len(jobs) - len(kept)} sacct job(s) not in the job map were left out "
+                             "(--sacct-run-only keeps them, shared across the run's samples)")
+        jobs = kept
     if jobs and trace is None and job_map is None:
         reg.notes.append("no --trace or --job-map: every Slurm job is shared across the run's samples")
-    mapped: Dict[str, str] = {}
-    if job_map is not None:
-        for row in _rows(job_map, ("job_id", "sample_id")):
-            if row["sample_id"] not in samples:
-                raise InputError(f"{job_map} line {row['_line']}: sample {row['sample_id']} is not in this run")
-            mapped[row["job_id"]] = row["sample_id"]
 
     two = []
     for p in files:
@@ -356,13 +398,17 @@ def register_run(
                 sample = match_sample(tag, samples) if tag else None
                 if sample is not None and other_sample_in(tag, sample, samples):
                     sample = None
-            if ledger.one("SELECT prun_id FROM jobs WHERE job_id = ?", (j.job_id,)):
-                raise InputError(f"Slurm job {j.job_id} is already recorded for another pipeline run")
+            existing = ledger.one("SELECT prun_id FROM jobs WHERE job_id = ?", (j.key,))
+            if existing and (j.job_id in cached or j.alt_id in cached):
+                reg.notes.append(f"Slurm job {j.key} is a cached task already recorded for {existing[0]}; left out")
+                continue
+            if existing:
+                raise InputError(f"Slurm job {j.key} is already recorded for pipeline run {existing[0]}")
             ledger.execute(
                 "INSERT INTO jobs (job_id, prun_id, name, tag, state, elapsed_s, alloc_cpus, req_mem_bytes, gpus, "
                 "sample_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
-                    j.job_id,
+                    j.key,
                     prun_id,
                     j.name or None,
                     tags.get(j.job_id) or tags.get(j.alt_id) or None,
@@ -384,7 +430,10 @@ def register_run(
 
 
 def reads_on_record(ledger: Ledger, sample: str) -> Optional[int]:
-    """The sample's total reads over its lanes now, or None if a lane has no read count."""
+    """The sample's total reads over its lanes now, or None if it has no lanes or a lane has no read count.
+
+    A partial total is never returned: it would bill the sample less than its share of a run's shared jobs.
+    """
     row = ledger.one("SELECT COUNT(*), COUNT(reads), SUM(reads) FROM sample_runs WHERE sample_id = ?", (sample,))
     if row is None or row[0] == 0 or row[0] != row[1]:
         return None

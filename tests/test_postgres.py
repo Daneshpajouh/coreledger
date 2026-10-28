@@ -79,7 +79,7 @@ def test_rollback_on_postgres(tmp_path, pg_target):
     write(tmp_path / "o2" / "A.txt", "a")
     assert main(["init", pg_target]) == 0
     assert main(["intake", pg_target, str(tmp_path / "i.csv")]) == 0
-    base = ["--pipeline", "p", "--sample", "A", "--sacct", str(tmp_path / "sacct.txt")]
+    base = ["--pipeline", "p", "--sample", "A", "--sacct", str(tmp_path / "sacct.txt"), "--sacct-run-only"]
     assert main(["register", pg_target, "R1", "--outdir", str(tmp_path / "o1"), *base]) == 0
     # the same Slurm jobs again: refused after the run and its results were written, so all of it is undone
     assert main(["register", pg_target, "R2", "--outdir", str(tmp_path / "o2"), *base]) == 2
