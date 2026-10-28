@@ -32,7 +32,10 @@ requirements:
 test:
   imports:
     - coreledger
+  requires:
+    - pip
   commands:
+    - pip check
     - coreledger --version
     - coreledger audit --help
 
