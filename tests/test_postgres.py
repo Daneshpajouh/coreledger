@@ -13,7 +13,7 @@ import pytest
 from coreledger import audit, db
 from coreledger.cli import main
 
-from .test_core import COMMIT, RATES, SACCT, TRACE, write
+from .test_core import COMMIT, FINISHED, RATES, SACCT, TRACE, write
 
 URL = os.environ.get("COREL_PG_URL")
 pytestmark = pytest.mark.skipif(not URL, reason="set COREL_PG_URL to run the PostgreSQL tests")
@@ -74,7 +74,7 @@ def test_end_to_end_on_postgres(tmp_path, pg_target, capsys):
 
 def test_rollback_on_postgres(tmp_path, pg_target):
     write(tmp_path / "i.csv", "sample_id,project_id\nA,P1\n")
-    write(tmp_path / "sacct.txt", SACCT)
+    write(tmp_path / "sacct.txt", FINISHED)
     (tmp_path / "o1").mkdir()
     write(tmp_path / "o2" / "A.txt", "a")
     assert main(["init", pg_target]) == 0
