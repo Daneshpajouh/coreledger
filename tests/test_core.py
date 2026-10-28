@@ -436,3 +436,111 @@ def test_cli_errors_exit_2(tmp_path, capsys):
     assert main(["intake", str(tmp_path / "none.sqlite"), "x.csv"]) == 2
     assert "run coreledger init first" in capsys.readouterr().err
     assert not (tmp_path / "none.sqlite").exists()
+
+
+# edge cases: array lines, requeued attempts, linked files, contrast files, read snapshots
+
+
+def test_sacct_skips_array_range_lines_and_bills_requeued(tmp_path):
+    text = (
+        "JobID|JobIDRaw|State|Elapsed|AllocCPUS|NNodes|ReqMem\n"
+        "300_[3-10]|300|CANCELLED|00:00:00|0|1|4G\n"
+        "300_1|301|COMPLETED|01:00:00|2|1|4G\n"
+        "302|302|REQUEUED|00:30:00|2|1|4G\n"
+    )
+    jobs, notes = slurm.read_sacct(write(tmp_path / "s.txt", text))
+    assert [(j.job_id, j.state) for j in jobs] == [("301", "COMPLETED"), ("302", "REQUEUED")]
+    assert notes == ["job 300_[3-10] skipped: an array line that covers a range of tasks"]
+
+
+def test_sacct_per_node_memory_needs_nnodes(tmp_path):
+    with pytest.raises(slurm.FormatError, match="NNodes"):
+        slurm.read_sacct(write(tmp_path / "s.txt", "JobIDRaw|Elapsed|AllocCPUS|ReqMem\n1|01:00:00|4|16000Mn\n"))
+
+
+def test_reqmem_fraction_is_exact():
+    assert slurm.parse_reqmem("0.1G", 1, 1) == round(Fraction(1, 10) * 1024**3)
+
+
+def test_register_keeps_linked_files_and_notes_linked_folders(tmp_path, ledger):
+    write(tmp_path / "i.csv", "sample_id,project_id\nA,P1\n")
+    ingest.intake(ledger, tmp_path / "i.csv")
+    store = tmp_path / "work"
+    write(store / "A.bam", "bam A")
+    write(store / "dir" / "A.bai", "bai A")
+    out = tmp_path / "out"
+    (out / "align").mkdir(parents=True)
+    (out / "align" / "A.bam").symlink_to(store / "A.bam")
+    (out / "linked").symlink_to(store / "dir")
+    reg = ingest.register_run(ledger, "R1", "p", out, ["A"], commit=COMMIT)
+    assert [r[0] for r in ledger.query("SELECT path FROM results")] == ["align/A.bam"]
+    assert reg.notes == ["1 linked folder(s) not entered: linked"]
+    assert "NO_RESULTS" not in [f.code for f in audit.audit(ledger)]
+
+
+def test_contrast_file_belongs_to_neither_sample():
+    samples = ["KO_REP1", "WT_REP1", "S1", "S1_T2"]
+    assert ingest.sample_for_path("de/KO_REP1_vs_WT_REP1.tsv", samples) is None
+    assert ingest.sample_for_path("align/S1_T2.bam", samples) == "S1_T2"
+    assert ingest.sample_for_path("align/KO_REP1.WT_REP1x.bam", samples) == "KO_REP1"
+
+
+def test_same_content_pattern_leaves_folder_names_alone(tmp_path, ledger):
+    write(tmp_path / "i.csv", "sample_id,project_id\nqc,P1\nwt,P1\n")
+    ingest.intake(ledger, tmp_path / "i.csv")
+    out = tmp_path / "o"
+    write(out / "fastqc" / "qc_1.html", "same")
+    write(out / "fastqc" / "wt_1.html", "same")
+    ingest.register_run(ledger, "R1", "p", out, ["qc", "wt"], commit=COMMIT)
+    assert audit.name_pattern("fastqc/qc_1.html", "qc") == "fastqc/{sample}_1.html"
+    assert ("SAME_CONTENT", "qc,wt") in codes(audit.audit(ledger))
+
+
+def test_register_notes_jobs_without_trace_or_map(tmp_path, ledger):
+    write(tmp_path / "i.csv", "sample_id,project_id\nA,P1\n")
+    ingest.intake(ledger, tmp_path / "i.csv")
+    write(tmp_path / "o" / "A.txt", "a")
+    sacct = write(tmp_path / "s.txt", "JobIDRaw|Elapsed|AllocCPUS|ReqMem\n1|01:00:00|4|8G\n")
+    reg = ingest.register_run(ledger, "R1", "p", tmp_path / "o", ["A"], commit=COMMIT, sacct=sacct)
+    assert reg.notes == ["no --trace or --job-map: every Slurm job is shared across the run's samples"]
+
+
+def test_read_split_uses_reads_recorded_at_register(tmp_path, core, ledger):
+    card = billing.RateCard(currency="CAD", rates={"cpu_hour": Fraction(1)})
+    before = {sl.sample_id: sl.exact for sl in billing.build_bill(ledger, card).samples}
+    write(tmp_path / "late.csv", "sample_id,run_id,lane,reads\nA,RUN2,1,9000000\n")
+    ingest.add_sequencing(ledger, tmp_path / "late.csv")
+    after = {sl.sample_id: sl.exact for sl in billing.build_bill(ledger, card).samples}
+    assert after == before
+
+
+def test_tagged_job_of_a_sample_not_in_the_run_is_unallocated(core, ledger):
+    ledger.execute("DELETE FROM prun_samples WHERE prun_id = 'R1'")
+    ledger.commit()
+    card = billing.RateCard(currency="CAD", rates={"cpu_hour": Fraction(1)})
+    bill = billing.build_bill(ledger, card, split="equal")
+    assert bill.samples == []
+    assert sorted(j for j, _ in bill.unallocated) == ["101", "102", "103"]
+
+
+def test_cli_exclude_replaces_the_default_and_bill_exits_1_on_unallocated(tmp_path, capsys):
+    dbp = str(tmp_path / "c.sqlite")
+    write(tmp_path / "i.csv", "sample_id,project_id\nA,P1\n")
+    write(tmp_path / "res" / "pipeline_info" / "t.txt", "kept")
+    write(tmp_path / "res" / "skip" / "A.txt", "a")
+    write(tmp_path / "sacct.txt", "JobIDRaw|Elapsed|AllocCPUS|ReqMem\n1|01:00:00|4|8G\n")
+    write(tmp_path / "rates.json", json.dumps(RATES))
+    assert main(["init", dbp]) == 0
+    assert main(["intake", dbp, str(tmp_path / "i.csv")]) == 0
+    assert main([
+        "register", dbp, "R1", "--outdir", str(tmp_path / "res"), "--pipeline", "p", "--sample", "A",
+        "--commit", COMMIT,
+        "--sacct", str(tmp_path / "sacct.txt"), "--exclude", "skip",
+    ]) == 0
+    lg = db.connect(dbp)
+    assert [r[0] for r in lg.query("SELECT path FROM results")] == ["pipeline_info/t.txt"]
+    lg.execute("DELETE FROM prun_samples")
+    lg.commit()
+    lg.close()
+    assert main(["bill", dbp, "--rates", str(tmp_path / "rates.json"), "--outdir", str(tmp_path / "b")]) == 1
+    assert "unallocated: job 1" in capsys.readouterr().out

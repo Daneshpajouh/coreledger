@@ -57,6 +57,7 @@ TABLES = [
     """CREATE TABLE IF NOT EXISTS prun_samples (
         prun_id TEXT NOT NULL REFERENCES pipeline_runs (prun_id),
         sample_id TEXT NOT NULL REFERENCES samples (sample_id),
+        reads BIGINT,
         PRIMARY KEY (prun_id, sample_id)
     )""",
     """CREATE TABLE IF NOT EXISTS results (

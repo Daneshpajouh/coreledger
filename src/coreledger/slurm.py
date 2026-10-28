@@ -3,7 +3,10 @@
 sacct input is ``sacct --parsable2`` output with a header line (fields separated by ``|``,
 no trailing ``|``), as described in the sacct manual (https://slurm.schedmd.com/sacct.html).
 Only allocation lines are kept; step lines such as ``1001.batch`` are skipped, since the
-allocation is what the scheduler holds and what a core pays for.
+allocation is what the scheduler holds and what a core pays for. Job array lines that still
+cover a range of tasks (``1001_[3-10]``) are skipped with a note, since each task that ran has
+its own line. A ``REQUEUED`` line is an attempt that held the allocation, so it counts like a
+``FAILED`` one.
 
 Columns used: ``JobIDRaw`` or ``JobID`` (one is required), ``Elapsed`` or ``ElapsedRaw``,
 ``AllocCPUS``, ``ReqMem`` (required); ``JobID``, ``JobName``, ``State``, ``NNodes`` and
@@ -16,11 +19,12 @@ Columns used: ``JobIDRaw`` or ``JobID`` (one is required), ``Elapsed`` or ``Elap
 import csv
 import re
 from dataclasses import dataclass
+from fractions import Fraction
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 UNITS = {"K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4, "P": 1024**5}
-NOT_FINISHED = {"PENDING", "RUNNING", "REQUEUED", "RESIZING", "SUSPENDED"}
+NOT_FINISHED = {"PENDING", "RUNNING", "RESIZING", "SUSPENDED"}
 
 
 class FormatError(ValueError):
@@ -63,7 +67,7 @@ def parse_reqmem(text: str, cpus: int, nodes: int) -> int:
         raise FormatError(f"not a ReqMem value: {text!r}")
     number, unit, per = m.groups()
     scale = UNITS[unit] if unit else UNITS["M"]
-    value = round(float(number) * scale)
+    value = round(Fraction(number) * scale)
     if per == "c":
         value *= cpus
     elif per == "n":
@@ -111,7 +115,11 @@ def read_sacct(path: Path) -> Tuple[List[Job], List[str]]:
             return row[col[name]] if name in col else ""
 
         job_id = get(id_col)
-        if "." in job_id or "." in get("JobID"):
+        shown = get("JobID")
+        if "." in job_id or "." in shown:
+            continue
+        if "[" in job_id or "[" in shown:
+            notes.append(f"job {shown or job_id} skipped: an array line that covers a range of tasks")
             continue
         state = get("State").split(" ")[0]
         if state in NOT_FINISHED:
@@ -120,6 +128,8 @@ def read_sacct(path: Path) -> Tuple[List[Job], List[str]]:
         try:
             cpus = int(get("AllocCPUS") or 0)
             nodes = int(get("NNodes") or 1)
+            if get("ReqMem").strip().endswith("n") and "NNodes" not in col:
+                raise FormatError(f"ReqMem {get('ReqMem')!r} is per node and there is no NNodes column")
             elapsed = int(get("ElapsedRaw")) if get("ElapsedRaw") else parse_elapsed(get("Elapsed"))
             mem = parse_reqmem(get("ReqMem"), cpus, nodes) if get("ReqMem") else 0
             gpus = parse_gpus(get("AllocTRES"))

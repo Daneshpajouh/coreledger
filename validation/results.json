@@ -73,6 +73,7 @@
     "manifest_found": 29,
     "planted": 145,
     "false_flags": 0,
+    "manifest_false_flags": 0,
     "false_flag_examples": []
   }
 }

@@ -7,8 +7,10 @@ spreadsheet: each sample's share rounded to cents on its own, then summed.
 
 Part 2, audit. Synthetic pipeline runs are registered through the public API with real
 files on disk, and one known defect is planted in some of them. The audit's findings are
-compared with the planted list. The baseline is a SHA-256 manifest of the result files
-checked later (``sha256sum -c``), which is what many cores keep.
+compared with the planted list. The baseline is a SHA-256 manifest of each run's result
+files, written when the run is registered and checked again after the defects are planted,
+as ``sha256sum -c`` would do; that is what many cores keep. A planted defect counts as found
+by the manifest when the check fails for that run.
 
 Everything is synthetic and seeded; no real facility data is used. Run:
 
@@ -58,16 +60,20 @@ def part1(n_projects: int, seed: int) -> dict:
         ledger.executemany(
             "INSERT INTO samples (sample_id, project_id) VALUES (?, ?)", [(s, project) for s in samples]
         )
+        reads = {s: rng.randint(5 * 10**6, 80 * 10**6) for s in samples}
         ledger.executemany(
             "INSERT INTO sample_runs (sample_id, run_id, lane, reads) VALUES (?, ?, ?, ?)",
-            [(s, "RUN", "1", rng.randint(5 * 10**6, 80 * 10**6)) for s in samples],
+            [(s, "RUN", "1", reads[s]) for s in samples],
         )
         prun = f"{project}-R"
         ledger.execute(
             "INSERT INTO pipeline_runs (prun_id, pipeline, outdir, registered) VALUES (?, ?, ?, ?)",
             (prun, "synthetic", "/nonexistent", "2026-10-28"),
         )
-        ledger.executemany("INSERT INTO prun_samples (prun_id, sample_id) VALUES (?, ?)", [(prun, s) for s in samples])
+        ledger.executemany(
+            "INSERT INTO prun_samples (prun_id, sample_id, reads) VALUES (?, ?, ?)",
+            [(prun, s, reads[s]) for s in samples],
+        )
         jobs = []
         for s in samples:
             for _ in range(rng.randint(3, 15)):
@@ -107,7 +113,20 @@ def part1(n_projects: int, seed: int) -> dict:
 
 DEFECTS = ["NO_RESULTS", "SAME_CONTENT", "NO_SEQUENCING", "NO_COMMIT", "NO_GATE",
            "GATE_NOT_PASS", "GATE_MOVED", "MISSING", "CHANGED", "UNBILLABLE"]
-MANIFEST_CATCHES = {"MISSING", "CHANGED"}
+
+
+def manifest(outdir: Path) -> dict:
+    """Relative path to SHA-256 for every file under a run's results folder."""
+    return {p.relative_to(outdir).as_posix(): ingest.sha256_file(p) for p in sorted(outdir.rglob("*")) if p.is_file()}
+
+
+def manifest_fails(outdir: Path, kept: dict) -> bool:
+    """True when ``sha256sum -c`` on the kept manifest would report a missing or changed file."""
+    for rel, digest in kept.items():
+        p = outdir / rel
+        if not p.is_file() or ingest.sha256_file(p) != digest:
+            return True
+    return False
 
 
 def part2(n_runs: int, seed: int, work: Path) -> dict:
@@ -117,6 +136,7 @@ def part2(n_runs: int, seed: int, work: Path) -> dict:
     expected = set()
     planted = {d: 0 for d in DEFECTS}
     after = []
+    manifests = {}
     for r in range(n_runs):
         prun = f"R{r:04d}"
         n = rng.randint(2, 12)
@@ -154,6 +174,7 @@ def part2(n_runs: int, seed: int, work: Path) -> dict:
             sacct=sacct, today="2026-10-28",
         )
         ingest.release(ledger, prun, force=defect in ("NO_GATE", "GATE_NOT_PASS"), today="2026-10-28")
+        manifests[prun] = (out, manifest(out))
         if defect is None:
             continue
         planted[defect] += 1
@@ -188,6 +209,8 @@ def part2(n_runs: int, seed: int, work: Path) -> dict:
 
     found = {(f.code, f.prun_id, f.subject) for f in audit.audit(ledger, check_files=True)}
     ledger.close()
+    manifest_runs = {prun for prun, (out, kept) in manifests.items() if manifest_fails(out, kept)}
+    defect_runs = {e[1] for e in expected}
     per = {}
     for d in DEFECTS:
         exp = {e for e in expected if e[0] == d}
@@ -195,7 +218,7 @@ def part2(n_runs: int, seed: int, work: Path) -> dict:
         per[d] = {
             "planted": planted[d],
             "coreledger_found": len(hit),
-            "manifest_found": len(exp) if d in MANIFEST_CATCHES else 0,
+            "manifest_found": sum(e[1] in manifest_runs for e in exp),
         }
     false_flags = sorted(found - expected)
     return {
@@ -207,6 +230,7 @@ def part2(n_runs: int, seed: int, work: Path) -> dict:
         "manifest_found": sum(v["manifest_found"] for v in per.values()),
         "planted": len(expected),
         "false_flags": len(false_flags),
+        "manifest_false_flags": len(manifest_runs - defect_runs),
         "false_flag_examples": [list(x) for x in false_flags[:5]],
     }
 

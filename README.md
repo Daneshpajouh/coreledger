@@ -49,9 +49,9 @@ PRJ0042,WT_REP1,25.6865,175.1856,0.0000,0.688971,0.69,CAD
 PRJ0042,WT_REP2,23.1028,157.6494,0.0000,0.619849,0.62,CAD
 ```
 
-A result belongs to a sample when a folder or file name in its path starts with the sample ID followed by `.`, `_`, `-` or nothing; the longest matching ID wins, and a path that names two samples belongs to neither. `pipeline_info` is left out unless `--exclude` says otherwise. Files that name no sample, such as the MultiQC report, are recorded for the run.
+A result belongs to a sample when a folder or file name in its path starts with the sample ID followed by `.`, `_`, `-` or nothing; the longest matching ID wins, and a path that names two samples belongs to neither, so a contrast file such as `KO_REP1_vs_WT_REP1.tsv` is recorded for the run. `pipeline_info` is left out unless `--exclude` is given, which then replaces it. Files that name no sample, such as the MultiQC report, are recorded for the run. A linked file (Nextflow's `publishDir` mode `symlink`) is recorded with the hash of the file it points to; a linked folder is not entered, and `register` says so.
 
-With `--trace`, only the Slurm jobs listed in the Nextflow trace are taken from `sacct`, so a `sacct` query that caught someone else's job (8811299 above) does no harm. A job's tag, the bracketed part of the task name (`STAR_ALIGN (WT_REP1)`), names its sample. Jobs without a sample tag, such as the genome index build and MultiQC, are shared by the run's samples. For pipelines without a Nextflow trace, `--job-map` takes a CSV of `job_id,sample_id`.
+With `--trace`, only the Slurm jobs listed in the Nextflow trace are taken from `sacct`, so a `sacct` query that caught someone else's job (8811299 above) does no harm. A job's tag, the bracketed part of the task name (`STAR_ALIGN (WT_REP1)`), names its sample. Jobs without a sample tag, such as the genome index build and MultiQC, are shared by the run's samples. For pipelines without a Nextflow trace, `--job-map` takes a CSV of `job_id,sample_id`. With neither, every job is shared, and `register` says so.
 
 `release` refuses a run whose gate did not pass. `--force` releases it anyway, and the audit then reports it.
 
@@ -63,7 +63,7 @@ With `--trace`, only the Slurm jobs listed in the Nextflow trace are taken from 
 | `SAME_CONTENT` | error | two samples have the same output (same path with the sample ID replaced) with identical bytes, as a copied file or a sample sheet error leaves it; empty files are skipped |
 | `NO_GATE` | error | a released run has no gate report |
 | `GATE_NOT_PASS` | error | a released run's gate said FAIL or ERROR |
-| `GATE_MOVED` | error | the gate report file is gone or no longer gives the recorded verdict |
+| `GATE_MOVED` | error | the gate report file is gone or no longer gives the recorded verdict; checked before release too, since `release` goes by the recorded verdict |
 | `MISSING` | error | a recorded result file is gone (with `--files`) |
 | `CHANGED` | error | a recorded result file's bytes changed (with `--files`) |
 | `NO_SEQUENCING` | warning | a sample of a run has no sequencing lane recorded |
@@ -82,11 +82,11 @@ The rate card is JSON. Rates are strings so that they stay exact:
 }
 ```
 
-Jobs are billed on what they held, not what they used: allocated CPUs times elapsed time, requested memory (GiB) times elapsed time, and GPUs from `AllocTRES`. That is what the scheduler kept from other users. `ReqMem` is read in both the Slurm 21.08 and later form (`72G`, whole job) and the older per-CPU and per-node forms (`4000Mc`, `16000Mn`). Without `bill_states`, every finished job is billed, failed attempts included: in the example, `KO_REP1`'s first STAR run ran out of memory after 41 minutes and is part of its CAD 1.20. Running and pending jobs are never billed.
+Jobs are billed on what they held, not what they used: allocated CPUs times elapsed time, requested memory (GiB) times elapsed time, and GPUs from `AllocTRES`. That is what the scheduler kept from other users. `ReqMem` is read in both the Slurm 21.08 and later form (`72G`, whole job) and the older per-CPU and per-node forms (`4000Mc`, `16000Mn`). Without `bill_states`, every finished job is billed, failed attempts included: in the example, `KO_REP1`'s first STAR run ran out of memory after 41 minutes and is part of its CAD 1.20. That default also bills `CANCELLED`, `NODE_FAIL`, `PREEMPTED` and `REQUEUED` attempts for the time they ran; list the states you charge for in `bill_states` if your core's policy differs. Running and pending jobs are never billed, and a job array line that still covers a range of tasks (`1001_[3-10]`) is skipped with a note.
 
-Shared jobs are split in proportion to each sample's reads (`--split reads`, the default; every lane needs a read count) or equally (`--split equal`).
+Shared jobs are split in proportion to each sample's reads (`--split reads`, the default) or equally (`--split equal`). The reads are the totals on record when the run was registered, so a lane added later does not change an earlier run's split; record the lanes, with read counts, before `register`. A job tagged with a sample that is not in its run, or a run with no samples, is reported as unallocated, and `bill` then exits 1 so that a delivery script does not send a bill with money left out.
 
-All arithmetic is in exact fractions. Each project's total is rounded once, to the cent, half up. That total is then divided into sample amounts in cents by the largest remainder method, with ties going to the sample ID that sorts first, so the sample lines always add up to the project line. Rounding each sample's share on its own does not: in the two-sample test case, shares of CAD 0.315 and CAD 0.175 round to CAD 0.32 and CAD 0.18, which is CAD 0.50 for a CAD 0.49 project.
+All arithmetic is in exact fractions, `ReqMem` values included. Each project's total is rounded once, to the cent, half up. That total is then divided into sample amounts in cents by the largest remainder method, with ties going to the sample ID that sorts first, so the sample lines always add up to the project line. Rounding each sample's share on its own does not: in the two-sample test case, shares of CAD 0.315 and CAD 0.175 round to CAD 0.32 and CAD 0.18, which is CAD 0.50 for a CAD 0.49 project.
 
 ## SOPs from a parameter schema
 
@@ -128,9 +128,9 @@ Audit, 300 pipeline runs registered through the API with real files on disk, 145
 | | Planted | Found by `coreledger audit --files` | Found by a SHA-256 manifest (`sha256sum -c`) |
 |---|---|---|---|
 | All types | 145 | 145 | 29 |
-| False findings on the other runs | | 0 | |
+| False findings on the other runs | | 0 | 0 |
 
-The manifest finds only the moved and edited files, which is what it is built for. This test shows that each check fires on the defect it was written for and stays quiet otherwise; it cannot show that the ten types cover what goes wrong in a given core. The per-type counts are in `validation/results.json`.
+The manifest is written for each run's results folder at registration and checked again after the defects are planted; a defect counts as found when that check fails for its run. It finds only the moved and edited files, which is what it is built for. This test shows that each check fires on the defect it was written for and stays quiet otherwise. It has limits: the expected findings follow the same rules as the code, each run gets at most one defect, and the planted files are plain. So it cannot show that the rules are right for a given core or that the ten types cover what goes wrong there. The harder cases the reviews raised (array lines, linked files, contrast files, a sample ID inside a folder name, lanes added later) are unit tests in `tests/test_core.py`. The per-type counts are in `validation/results.json`.
 
 Run it with `python validation/known_answer.py --out results.json`. CI runs a smaller size on every push.
 

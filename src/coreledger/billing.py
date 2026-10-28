@@ -15,7 +15,7 @@ import json
 from dataclasses import dataclass, field
 from fractions import Fraction
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 from .db import Ledger
 
@@ -139,25 +139,26 @@ def job_uses(ledger: Ledger, prun_ids: Optional[Sequence[str]] = None) -> List[J
 
 
 def sample_weights(ledger: Ledger, prun_id: str, by: str) -> List[Tuple[str, str, Fraction]]:
-    """(project, sample, weight) for every sample of a pipeline run."""
+    """(project, sample, weight) for every sample of a pipeline run.
+
+    Read weights are the totals recorded when the run was registered, so a lane added later does not
+    change how an earlier run's shared jobs were split.
+    """
     rows = ledger.query(
-        "SELECT s.project_id, s.sample_id FROM prun_samples p JOIN samples s ON s.sample_id = p.sample_id "
+        "SELECT s.project_id, s.sample_id, p.reads FROM prun_samples p JOIN samples s ON s.sample_id = p.sample_id "
         "WHERE p.prun_id = ? ORDER BY s.sample_id",
         (prun_id,),
     )
     if by == "equal":
-        return [(p, s, Fraction(1)) for p, s in rows]
+        return [(p, s, Fraction(1)) for p, s, _ in rows]
     out = []
-    for project, sample in rows:
-        reads = ledger.one(
-            "SELECT COUNT(*), COUNT(reads), SUM(reads) FROM sample_runs WHERE sample_id = ?", (sample,)
-        )
-        if reads is None or reads[0] == 0 or reads[0] != reads[1]:
+    for project, sample, reads in rows:
+        if reads is None:
             raise ValueError(
-                f"sample {sample} has no read count on every lane, so shared jobs of {prun_id} cannot be split "
-                "by reads; record the reads or use --split equal"
+                f"sample {sample} had no read count on every lane when {prun_id} was registered, so its shared "
+                "jobs cannot be split by reads; use --split equal"
             )
-        out.append((project, sample, Fraction(int(reads[2]))))
+        out.append((project, sample, Fraction(int(reads))))
     return out
 
 
@@ -170,6 +171,7 @@ def build_bill(
     unallocated: List[Tuple[str, Fraction]] = []
     skipped: List[str] = []
     weights_cache: Dict[str, List[Tuple[str, str, Fraction]]] = {}
+    members_cache: Dict[str, Set[str]] = {}
     project_of = dict(ledger.query("SELECT sample_id, project_id FROM samples"))
 
     def line(project: str, sample: str) -> SampleLine:
@@ -183,6 +185,13 @@ def build_bill(
             continue
         cost = use.cost(card)
         if use.sample_id is not None:
+            if use.prun_id not in members_cache:
+                members_cache[use.prun_id] = {r[0] for r in ledger.query(
+                    "SELECT sample_id FROM prun_samples WHERE prun_id = ?", (use.prun_id,)
+                )}
+            if use.sample_id not in members_cache[use.prun_id]:
+                unallocated.append((use.job_id, cost))
+                continue
             parts = [(project_of[use.sample_id], use.sample_id, Fraction(1))]
         else:
             if use.prun_id not in weights_cache:

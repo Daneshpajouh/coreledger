@@ -55,7 +55,7 @@ def cmd_register(args: argparse.Namespace) -> int:
         trace=Path(args.trace) if args.trace else None,
         job_map=Path(args.job_map) if args.job_map else None,
         gate=Path(args.gate) if args.gate else None,
-        exclude=tuple(args.exclude),
+        exclude=tuple(args.exclude) if args.exclude is not None else ("pipeline_info",),
     )
     print(
         f"{reg.prun_id}: {reg.results} result file(s), {reg.per_sample} named for a sample; "
@@ -131,7 +131,7 @@ def cmd_bill(args: argparse.Namespace) -> int:
         print(f"unallocated: job {job_id}, {billing.decimal_text(cost, 6)} {bill.currency} (no samples to charge)")
     for note in bill.skipped:
         print(f"skipped: {note}")
-    return 0
+    return 1 if bill.unallocated else 0
 
 
 def cmd_sop(args: argparse.Namespace) -> int:
@@ -185,7 +185,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--trace", help="Nextflow trace file (maps Slurm jobs to task tags)")
     s.add_argument("--job-map", help="CSV job_id,sample_id for jobs a trace cannot tag")
     s.add_argument("--gate", help="tolgate JSON report (or any JSON with verdict PASS, FAIL or ERROR)")
-    s.add_argument("--exclude", action="append", default=["pipeline_info"], help="folder names to leave out")
+    s.add_argument(
+        "--exclude", action="append", default=None,
+        help="folder names to leave out (repeat for more; default pipeline_info)",
+    )
     s.set_defaults(func=cmd_register)
 
     s = sub.add_parser("release", help="mark a pipeline run released (needs a passing gate)")

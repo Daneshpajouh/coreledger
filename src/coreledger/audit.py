@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 
 from .db import Ledger
-from .ingest import sha256_file
+from .ingest import SEPARATORS, sha256_file
 
 ERROR = "error"
 WARNING = "warning"
@@ -52,8 +52,17 @@ class Finding:
 
 
 def name_pattern(path: str, sample: str) -> str:
-    """The result path with its sample ID replaced, so the same output of two samples compares equal."""
-    return path.replace(sample, "{sample}")
+    """The result path with its sample ID replaced, so the same output of two samples compares equal.
+
+    Only a path piece that is the ID, or starts with it and a separator, is rewritten, so sample ``qc``
+    leaves the folder ``fastqc`` alone.
+    """
+    parts = []
+    for part in path.split("/"):
+        if part == sample or (part.startswith(sample) and part[len(sample)] in SEPARATORS):
+            part = "{sample}" + part[len(sample):]
+        parts.append(part)
+    return "/".join(parts)
 
 
 def audit(ledger: Ledger, check_files: bool = False) -> List[Finding]:

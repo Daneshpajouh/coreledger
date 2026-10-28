@@ -140,12 +140,33 @@ def match_sample(text: str, samples: Iterable[str]) -> Optional[str]:
     return best
 
 
+def other_sample_in(text: str, first: str, samples: Iterable[str]) -> bool:
+    """True if a second sample ID, between separators, follows the leading one (``KO_1_vs_WT_1.tsv``)."""
+    rest = text[len(first):]
+    for s in samples:
+        start = 0
+        while True:
+            i = rest.find(s, start)
+            if i < 0:
+                break
+            end = i + len(s)
+            if (i == 0 or rest[i - 1] in SEPARATORS) and (end == len(rest) or rest[end] in SEPARATORS):
+                return True
+            start = i + 1
+    return False
+
+
 def sample_for_path(rel: str, samples: Sequence[str]) -> Optional[str]:
-    """The one sample a result path names, in a folder or the file name; None if none or more than one."""
+    """The one sample a result path names, in a folder or the file name; None if none or more than one.
+
+    A path piece that names two samples, such as a contrast file ``KO_1_vs_WT_1.tsv``, belongs to neither.
+    """
     found = set()
     for part in Path(rel).parts:
         hit = match_sample(part, samples)
         if hit:
+            if other_sample_in(part, hit, samples):
+                return None
             found.add(hit)
     return found.pop() if len(found) == 1 else None
 
@@ -217,13 +238,16 @@ def register_run(
         gate_path = str(Path(gate).resolve())
 
     files = []
+    linked_dirs = []
     for root, dirs, names in os.walk(outdir):
         dirs[:] = sorted(d for d in dirs if d not in exclude)
+        linked_dirs.extend(Path(root, d).relative_to(outdir).as_posix() for d in dirs if Path(root, d).is_symlink())
         for name in sorted(names):
             p = Path(root) / name
-            if p.is_symlink() or not p.is_file():
-                continue
-            files.append(p)
+            if p.is_file():
+                files.append(p)
+    if linked_dirs:
+        reg.notes.append(f"{len(linked_dirs)} linked folder(s) not entered: {', '.join(linked_dirs[:5])}")
 
     jobs: List[slurm.Job] = []
     tags: Dict[str, str] = {}
@@ -240,6 +264,8 @@ def register_run(
         if sacct is not None and missing:
             reg.notes.append(f"{len(missing)} trace job(s) not found in sacct: {', '.join(missing[:5])}")
         jobs = kept
+    if jobs and trace is None and job_map is None:
+        reg.notes.append("no --trace or --job-map: every Slurm job is shared across the run's samples")
     mapped: Dict[str, str] = {}
     if job_map is not None:
         for row in _rows(job_map, ("job_id", "sample_id")):
@@ -266,7 +292,8 @@ def register_run(
             ),
         )
         ledger.executemany(
-            "INSERT INTO prun_samples (prun_id, sample_id) VALUES (?, ?)", [(prun_id, s) for s in samples]
+            "INSERT INTO prun_samples (prun_id, sample_id, reads) VALUES (?, ?, ?)",
+            [(prun_id, s, reads_on_record(ledger, s)) for s in samples],
         )
         for p in files:
             rel = p.relative_to(outdir).as_posix()
@@ -307,6 +334,14 @@ def register_run(
         ledger.rollback()
         raise
     return reg
+
+
+def reads_on_record(ledger: Ledger, sample: str) -> Optional[int]:
+    """The sample's total reads over its lanes now, or None if a lane has no read count."""
+    row = ledger.one("SELECT COUNT(*), COUNT(reads), SUM(reads) FROM sample_runs WHERE sample_id = ?", (sample,))
+    if row is None or row[0] == 0 or row[0] != row[1]:
+        return None
+    return int(row[2])
 
 
 def release(ledger: Ledger, prun_id: str, force: bool = False, today: Optional[str] = None) -> None:
