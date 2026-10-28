@@ -1049,3 +1049,25 @@ def test_r6_a_job_map_job_missing_from_sacct_is_noted(tmp_path, ledger):
     reg = ingest.register_run(ledger, "R1", "p", tmp_path / "o", ["A"], commit=COMMIT, sacct=sacct,
                               job_map=job_map)
     assert "1 job map job(s) not found in sacct: 102" in reg.notes
+
+
+def test_r6_a_lone_link_to_the_folder_holding_the_results_is_not_entered(tmp_path, ledger):
+    _r3_one_sample(tmp_path, ledger)
+    write(tmp_path / "notes.txt", "not a result")
+    out = tmp_path / "o"
+    (out / "top").symlink_to(tmp_path)
+    reg = ingest.register_run(ledger, "R1", "p", out, ["A"], commit=COMMIT)
+    assert [r[0] for r in ledger.query("SELECT path FROM results ORDER BY path")] == ["A.txt"]
+    assert reg.notes == ["1 " + NOT_ENTERED + "top"]
+
+
+def test_r6_a_link_back_to_its_own_store_ends(tmp_path, ledger):
+    _r3_one_sample(tmp_path, ledger)
+    store = tmp_path / "ext" / "A"
+    write(store / "sub" / "x.txt", "x")
+    (store / "sub" / "back").symlink_to(store)
+    out = tmp_path / "o"
+    (out / "A_store").symlink_to(store)
+    reg = ingest.register_run(ledger, "R1", "p", out, ["A"], commit=COMMIT)
+    assert [r[0] for r in ledger.query("SELECT path FROM results ORDER BY path")] == ["A.txt", "A_store/sub/x.txt"]
+    assert reg.notes == ["1 linked folder(s) entered: A_store", "1 " + NOT_ENTERED + "A_store/sub/back"]
