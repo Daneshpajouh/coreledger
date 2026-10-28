@@ -1,0 +1,49 @@
+{% set name = "coreledger" %}
+{% set version = "0.1.0" %}
+
+package:
+  name: {{ name }}
+  version: {{ version }}
+
+source:
+  url: https://pypi.org/packages/source/{{ name[0] }}/{{ name }}/{{ name }}-{{ version }}.tar.gz
+  # The sdist is rewritten by tools/normalize_sdist.py, so any rebuild of this release gives this hash.
+  sha256: SDIST_SHA256
+
+build:
+  number: 0
+  noarch: python
+  script: {{ PYTHON }} -m pip install . --no-deps --no-build-isolation -vvv
+  entry_points:
+    - coreledger = coreledger.cli:main
+  run_exports:
+    - {{ pin_subpackage(name, max_pin="x.x") }}
+
+requirements:
+  host:
+    - python >=3.9
+    - pip
+    - setuptools >=77
+  run:
+    - python >=3.9
+  run_constrained:
+    - psycopg >=3.1
+
+test:
+  imports:
+    - coreledger
+  commands:
+    - coreledger --version
+    - coreledger audit --help
+
+about:
+  home: https://github.com/Daneshpajouh/coreledger
+  license: Apache-2.0
+  license_family: APACHE
+  license_file: LICENSE
+  summary: Sample-to-result records, provenance audits, run SOPs and Slurm cost recovery for a sequencing or analysis core.
+  dev_url: https://github.com/Daneshpajouh/coreledger
+
+extra:
+  recipe-maintainers:
+    - Daneshpajouh

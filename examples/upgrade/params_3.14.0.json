@@ -1,0 +1,10 @@
+{
+  "input": "samplesheet.csv",
+  "outdir": "results",
+  "fasta": "GRCh38.primary_assembly.genome.fa",
+  "gtf": "gencode.v46.primary_assembly.annotation.gtf",
+  "aligner": "star_salmon",
+  "skip_dupradar": true,
+  "max_cpus": 32,
+  "max_memory": "256.GB"
+}

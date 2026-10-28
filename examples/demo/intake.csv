@@ -1,0 +1,4 @@
+sample_id,project_id,external_id,material,received
+WT_REP1,PRJ0042,tube 17,total RNA,2026-10-05
+WT_REP2,PRJ0042,tube 18,total RNA,2026-10-05
+KO_REP1,PRJ0042,tube 19,total RNA,2026-10-06

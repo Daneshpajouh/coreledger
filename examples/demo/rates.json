@@ -1,0 +1,4 @@
+{
+  "currency": "CAD",
+  "rates": {"cpu_hour": "0.0125", "mem_gib_hour": "0.0021"}
+}

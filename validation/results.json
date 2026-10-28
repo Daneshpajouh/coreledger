@@ -1,0 +1,78 @@
+{
+  "part1_cost_recovery": {
+    "projects": 2000,
+    "seed": 20261028,
+    "rates": {
+      "cpu_hour": "0.0125",
+      "mem_gib_hour": "0.0021",
+      "gpu_hour": "0.85"
+    },
+    "bill_vs_decimal_mismatches": 0,
+    "coreledger_projects_lines_not_adding_up": 0,
+    "naive_projects_lines_not_adding_up": 1508,
+    "naive_max_abs_cents": 7,
+    "naive_mean_abs_cents": 1.538
+  },
+  "part2_audit": {
+    "runs": 300,
+    "seed": 20261028,
+    "runs_with_a_defect": 145,
+    "per_defect": {
+      "NO_RESULTS": {
+        "planted": 12,
+        "coreledger_found": 12,
+        "manifest_found": 0
+      },
+      "SAME_CONTENT": {
+        "planted": 16,
+        "coreledger_found": 16,
+        "manifest_found": 0
+      },
+      "NO_SEQUENCING": {
+        "planted": 11,
+        "coreledger_found": 11,
+        "manifest_found": 0
+      },
+      "NO_COMMIT": {
+        "planted": 13,
+        "coreledger_found": 13,
+        "manifest_found": 0
+      },
+      "NO_GATE": {
+        "planted": 19,
+        "coreledger_found": 19,
+        "manifest_found": 0
+      },
+      "GATE_NOT_PASS": {
+        "planted": 20,
+        "coreledger_found": 20,
+        "manifest_found": 0
+      },
+      "GATE_MOVED": {
+        "planted": 14,
+        "coreledger_found": 14,
+        "manifest_found": 0
+      },
+      "MISSING": {
+        "planted": 14,
+        "coreledger_found": 14,
+        "manifest_found": 14
+      },
+      "CHANGED": {
+        "planted": 15,
+        "coreledger_found": 15,
+        "manifest_found": 15
+      },
+      "UNBILLABLE": {
+        "planted": 11,
+        "coreledger_found": 11,
+        "manifest_found": 0
+      }
+    },
+    "coreledger_found": 145,
+    "manifest_found": 29,
+    "planted": 145,
+    "false_flags": 0,
+    "false_flag_examples": []
+  }
+}

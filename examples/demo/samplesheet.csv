@@ -1,0 +1,4 @@
+sample,fastq_1,fastq_2,strandedness
+WT_REP1,WT_REP1_R1.fastq.gz,WT_REP1_R2.fastq.gz,auto
+WT_REP2,WT_REP2_R1.fastq.gz,WT_REP2_R2.fastq.gz,auto
+KO_REP1,KO_REP1_R1.fastq.gz,KO_REP1_R2.fastq.gz,auto
