@@ -1,0 +1,69 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        python: ["3.9", "3.12", "3.13"]
+        include:
+          - os: macos-latest
+            python: "3.13"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: pip install -e ".[test]" ruff
+      - run: ruff check src tests validation
+      - run: pytest -q
+      - name: Known-answer validation, small size
+        run: python validation/known_answer.py --projects 200 --runs 100 --out ka.json
+
+  postgres:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust  # a throwaway test database
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      COREL_PG_URL: postgresql://postgres@localhost:5432/postgres
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[test,postgres]"
+      - run: pytest -q tests/test_postgres.py
+
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # the normaliser reads the last commit time of the packaged files
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install build twine
+      - run: python -m build
+      - name: Normalise the sdist as a release does
+        run: |
+          python tools/normalize_sdist.py dist/coreledger-*.tar.gz \
+            "$(git log -1 --format=%ct -- src tests pyproject.toml README.md LICENSE)"
+          sha256sum dist/coreledger-*.tar.gz
+      - run: twine check --strict dist/*
+      - name: Installed wheel runs
+        run: |
+          pip install dist/*.whl
+          coreledger --version
