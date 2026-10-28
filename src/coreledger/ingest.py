@@ -212,6 +212,56 @@ def read_samplesheet(path: Path) -> List[str]:
     return out
 
 
+def _walk_results(outdir: Path, exclude: Sequence[str]) -> Tuple[List[Path], List[str], List[str]]:
+    """The result files under ``outdir``, the linked folders entered and the links not entered.
+
+    Linked folders are entered (nf-core publishDir mode symlink). A link is not entered when it
+    points back to a folder already on the way down, so a loop ends; into the results folder,
+    whose files are recorded under their own paths; or at a folder that holds the results folder
+    or the target of a linked folder that lies outside it, since that folder's other files belong
+    to other tasks. A plain folder is always entered. The walk is repeated with the link targets
+    it found until they settle, so the outcome does not depend on the order of names.
+    """
+    top = outdir.resolve()
+    anchors: Set[Tuple[Path, Path]] = set()
+    while True:
+        files: List[Path] = []
+        linked: List[str] = []
+        loops: List[str] = []
+        found: Set[Tuple[Path, Path]] = set()
+        above = {outdir: frozenset({top})}
+        for root, dirs, names in os.walk(outdir, followlinks=True):
+            kept = []
+            for d in sorted(dirs):
+                if d in exclude:
+                    continue
+                here = Path(root, d)
+                real = here.resolve()
+                if here.is_symlink():
+                    where = Path(root).resolve() / d
+                    holds = real != top and top.is_relative_to(real)
+                    holds = holds or any(
+                        t != real and t.is_relative_to(real) and not w.is_relative_to(real) for w, t in anchors
+                    )
+                    if real in above[Path(root)] or real.is_relative_to(top) or holds:
+                        loops.append(here.relative_to(outdir).as_posix())
+                        continue
+                    found.add((where, real))
+                    linked.append(here.relative_to(outdir).as_posix())
+                above[here] = above[Path(root)] | {real}
+                kept.append(d)
+            dirs[:] = kept
+            for name in sorted(names):
+                p = Path(root) / name
+                if p.is_file():
+                    files.append(p)
+                elif p.is_symlink():
+                    raise InputError(f"{p} is a link that does not point at a file; the result it stood for is gone")
+        if found <= anchors:
+            return files, linked, loops
+        anchors |= found
+
+
 def register_run(
     ledger: Ledger,
     prun_id: str,
@@ -270,41 +320,12 @@ def register_run(
         gate_cfg = report.get("config_sha256")
         gate_path = str(Path(gate).resolve())
 
-    files = []
-    linked_dirs = []
-    loops = []
-    # Linked folders are entered (nf-core publishDir mode symlink); a link back to a folder
-    # already on the way down is not, so a loop ends, and neither is a link to a folder that
-    # holds the output folder or a linked folder already entered, whose other files are not ours.
-    above = {outdir: frozenset({outdir.resolve()})}
-    entered = {outdir.resolve()}
-    for root, dirs, names in os.walk(outdir, followlinks=True):
-        kept_dirs = []
-        for d in sorted(dirs):
-            if d in exclude:
-                continue
-            here = Path(root, d)
-            real = here.resolve()
-            if real in above[Path(root)] or any(real != a and a.is_relative_to(real) for a in entered):
-                loops.append(here.relative_to(outdir).as_posix())
-                continue
-            above[here] = above[Path(root)] | {real}
-            kept_dirs.append(d)
-            if here.is_symlink():
-                entered.add(real)
-                linked_dirs.append(here.relative_to(outdir).as_posix())
-        dirs[:] = kept_dirs
-        for name in sorted(names):
-            p = Path(root) / name
-            if p.is_file():
-                files.append(p)
-            elif p.is_symlink():
-                raise InputError(f"{p} is a link that does not point at a file; the result it stood for is gone")
+    files, linked_dirs, loops = _walk_results(outdir, exclude)
     if linked_dirs:
         reg.notes.append(f"{len(linked_dirs)} linked folder(s) entered: {', '.join(linked_dirs[:5])}")
     if loops:
-        reg.notes.append(f"{len(loops)} link(s) to a folder above them or above a linked folder not entered: "
-                         f"{', '.join(loops[:5])}")
+        reg.notes.append(f"{len(loops)} linked folder(s) not entered (a loop, a folder inside the results, "
+                         f"or a folder that holds the results or another linked folder): {', '.join(loops[:5])}")
 
     jobs: List[slurm.Job] = []
     tags: Dict[str, str] = {}
@@ -344,16 +365,13 @@ def register_run(
         missing = sorted(set(tags) - listed)
         if sacct is not None and missing:
             reg.notes.append(f"{len(missing)} trace job(s) not found in sacct: {', '.join(missing[:5])}")
-    if trace is not None and not sacct_run_only:
-        kept = [j for j in jobs if j.job_id in tags or j.alt_id in tags]
+    if (trace is not None or job_map is not None) and not sacct_run_only:
+        # A job in the trace or in the job map is this run's; with both given, either list counts.
+        kept = [j for j in jobs if j.job_id in ours or j.alt_id in ours]
         if sacct is not None and len(kept) != len(jobs):
-            reg.notes.append(f"{len(jobs) - len(kept)} sacct job(s) not in the trace were left out "
-                             "(--sacct-run-only keeps them, shared across the run's samples)")
-        jobs = kept
-    elif job_map is not None and not sacct_run_only:
-        kept = [j for j in jobs if j.job_id in mapped or j.alt_id in mapped]
-        if len(kept) != len(jobs):
-            reg.notes.append(f"{len(jobs) - len(kept)} sacct job(s) not in the job map were left out "
+            which = "the trace or job map" if trace is not None and job_map is not None else (
+                "the trace" if trace is not None else "the job map")
+            reg.notes.append(f"{len(jobs) - len(kept)} sacct job(s) not in {which} were left out "
                              "(--sacct-run-only keeps them, shared across the run's samples)")
         jobs = kept
     if jobs and trace is None and job_map is None:

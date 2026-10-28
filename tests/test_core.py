@@ -671,6 +671,10 @@ def test_r2_blank_reads_unallocate_one_run_and_bill_the_rest(tmp_path, capsys):
 
 
 
+NOT_ENTERED = "linked folder(s) not entered (a loop, a folder inside the results, or a folder that holds the results " \
+    "or another linked folder): "
+
+
 def _r3_one_sample(tmp_path, ledger):
     write(tmp_path / "i.csv", "sample_id,project_id\nA,P1\n")
     ingest.intake(ledger, tmp_path / "i.csv")
@@ -753,7 +757,7 @@ def test_r3_linked_sample_folders_are_entered_and_loops_end(tmp_path, ledger):
     assert rows[2][2] == ingest.sha256_file(store / "quant.sf")
     assert reg.notes == [
         "2 linked folder(s) entered: again, salmon/A",
-        "3 link(s) to a folder above them or above a linked folder not entered: again/up, salmon/loop, salmon/A/up",
+        "3 " + NOT_ENTERED + "again/up, salmon/loop, salmon/A/up",
     ]
 
 
@@ -868,7 +872,7 @@ def test_r4_link_to_a_folder_holding_ours_is_not_entered(tmp_path, ledger):
     assert paths == ["A.txt", "again/quant.sf"]
     assert reg.notes == [
         "1 linked folder(s) entered: again",
-        "2 link(s) to a folder above them or above a linked folder not entered: top, again/up",
+        "2 " + NOT_ENTERED + "top, again/up",
     ]
 
 
@@ -892,4 +896,89 @@ def test_r4_sacct_run_only_keeps_jobs_outside_the_trace(tmp_path, ledger):
     )
     with pytest.raises(ingest.InputError, match=r"not finished \(104\)"):
         ingest.register_run(ledger, "R2", "p", tmp_path / "o", ["A"], commit=COMMIT, sacct=running, trace=trace,
+                            sacct_run_only=True)
+
+
+@pytest.mark.parametrize("wide", ["a_work", "zz_work"])
+def test_r5_link_order_does_not_decide_what_is_entered(tmp_path, ledger, wide):
+    _r3_one_sample(tmp_path, ledger)
+    store = tmp_path / "work" / "ab" / "A"
+    write(store / "quant.sf", "quant A")
+    write(tmp_path / "work" / "cd" / "B" / "other.sf", "another task's file")
+    out = tmp_path / "o"
+    (out / "m_sample").symlink_to(store)
+    (out / wide).symlink_to(tmp_path / "work")
+    reg = ingest.register_run(ledger, "R1", "p", out, ["A"], commit=COMMIT)
+    paths = [r[0] for r in ledger.query("SELECT path FROM results ORDER BY path")]
+    assert paths == ["A.txt", "m_sample/quant.sf"]
+    assert reg.notes == ["1 linked folder(s) entered: m_sample", "1 " + NOT_ENTERED + wide]
+
+
+def test_r5_link_into_the_results_does_not_hide_a_real_folder(tmp_path, ledger):
+    write(tmp_path / "i.csv", "sample_id,project_id\nKO,P1\nWT,P1\n")
+    ingest.intake(ledger, tmp_path / "i.csv")
+    out = tmp_path / "o"
+    write(out / "salmon" / "WT" / "quant.sf", "wt")
+    write(out / "salmon" / "KO" / "quant.sf", "ko")
+    (out / "latest").symlink_to(out / "salmon" / "WT")
+    reg = ingest.register_run(ledger, "R1", "p", out, ["WT", "KO"], commit=COMMIT)
+    rows = ledger.query("SELECT path, sample_id FROM results ORDER BY path")
+    assert [tuple(r) for r in rows] == [("salmon/KO/quant.sf", "KO"), ("salmon/WT/quant.sf", "WT")]
+    assert reg.notes == ["1 " + NOT_ENTERED + "latest"]
+
+
+def test_r5_link_inside_its_own_store_does_not_stop_the_store(tmp_path, ledger):
+    _r3_one_sample(tmp_path, ledger)
+    store = tmp_path / "work" / "A"
+    write(store / "quant.sf", "quant A")
+    write(store / "sub" / "x.txt", "x")
+    (store / "cur").symlink_to(store / "sub")
+    out = tmp_path / "o"
+    (out / "again").symlink_to(store)
+    reg = ingest.register_run(ledger, "R1", "p", out, ["A"], commit=COMMIT)
+    paths = [r[0] for r in ledger.query("SELECT path FROM results ORDER BY path")]
+    assert paths == ["A.txt", "again/cur/x.txt", "again/quant.sf", "again/sub/x.txt"]
+    assert reg.notes == ["2 linked folder(s) entered: again, again/cur"]
+
+
+def test_r5_jobs_in_the_job_map_count_beside_the_trace(tmp_path, ledger):
+    _r3_one_sample(tmp_path, ledger)
+    sacct = write(tmp_path / "s.txt", (
+        "JobID|JobIDRaw|State|Elapsed|AllocCPUS|ReqMem\n"
+        "101|101|COMPLETED|01:00:00|4|8G\n"
+        "102|102|COMPLETED|01:00:00|2|4G\n"
+        "103|103|COMPLETED|01:00:00|1|2G\n"
+    ))
+    trace = write(tmp_path / "t.txt", "native_id\tname\n101\tP (A)\n")
+    job_map = write(tmp_path / "m.csv", "job_id,sample_id\n102,A\n")
+    reg = ingest.register_run(ledger, "R1", "p", tmp_path / "o", ["A"], commit=COMMIT, sacct=sacct, trace=trace,
+                              job_map=job_map)
+    rows = ledger.query("SELECT job_id, sample_id FROM jobs ORDER BY job_id")
+    assert [tuple(r) for r in rows] == [("101", "A"), ("102", "A")]
+    assert "1 sacct job(s) not in the trace or job map were left out " \
+        "(--sacct-run-only keeps them, shared across the run's samples)" in reg.notes
+
+
+@pytest.mark.parametrize("line, column", [
+    ("101|101|COMPLETED|01:00:00||8G", "AllocCPUS"),
+    ("101|101|COMPLETED|01:00:00|4|", "ReqMem"),
+    ("101|101|COMPLETED|01:00:00| |8G", "AllocCPUS"),
+])
+def test_r5_blank_cpus_or_memory_is_refused(tmp_path, line, column):
+    sacct = write(tmp_path / "s.txt", "JobID|JobIDRaw|State|Elapsed|AllocCPUS|ReqMem\n" + line + "\n")
+    with pytest.raises(slurm.FormatError, match=f"line 2: {column} is empty"):
+        slurm.read_sacct(sacct)
+
+
+def test_r5_one_array_task_has_one_key_with_or_without_jobidraw(tmp_path, ledger):
+    _r3_one_sample(tmp_path, ledger)
+    write(tmp_path / "o2" / "A.txt", "a")
+    with_raw = write(
+        tmp_path / "s1.txt", "JobID|JobIDRaw|State|Elapsed|AllocCPUS|ReqMem\n300_1|301|COMPLETED|01:00:00|4|8G\n"
+    )
+    shown_only = write(tmp_path / "s2.txt", "JobID|State|Elapsed|AllocCPUS|ReqMem\n300_1|COMPLETED|01:00:00|4|8G\n")
+    ingest.register_run(ledger, "R1", "p", tmp_path / "o", ["A"], commit=COMMIT, sacct=with_raw, sacct_run_only=True)
+    assert [tuple(r) for r in ledger.query("SELECT job_id, prun_id FROM jobs")] == [("300_1", "R1")]
+    with pytest.raises(ingest.InputError, match=r"Slurm job 300_1 is already recorded for pipeline run R1"):
+        ingest.register_run(ledger, "R2", "p", tmp_path / "o2", ["A"], commit=COMMIT, sacct=shown_only,
                             sacct_run_only=True)

@@ -60,8 +60,14 @@ class Job:
 
     @property
     def key(self) -> str:
-        """The catalogue key: the Slurm ID, with ``#2`` and on for later records of the same ID."""
-        return self.job_id if self.record == 1 else f"{self.job_id}#{self.record}"
+        """The catalogue key: the ID sacct shows (``300_1``, not its raw ``301``), with ``#2`` and on
+        for later records of the same ID.
+
+        The shown ID is in every export, with or without a ``JobIDRaw`` column, so one task has
+        one key whichever columns an export has.
+        """
+        base = self.alt_id or self.job_id
+        return base if self.record == 1 else f"{base}#{self.record}"
 
 
 def parse_elapsed(text: str) -> int:
@@ -161,13 +167,17 @@ def read_sacct(path: Path, held: Optional[List[Tuple[str, str]]] = None) -> Tupl
             if held is not None:
                 held.append((shown, job_id))
             continue
+        # A blank size would bill the job as free.
+        for need in ("AllocCPUS", "ReqMem"):
+            if not get(need).strip():
+                raise FormatError(f"{path} line {n}: {need} is empty")
         try:
-            cpus = int(get("AllocCPUS") or 0)
+            cpus = int(get("AllocCPUS"))
             nodes = int(get("NNodes") or 1)
             if get("ReqMem").strip().endswith("n") and "NNodes" not in col:
                 raise FormatError(f"ReqMem {get('ReqMem')!r} is per node and there is no NNodes column")
             elapsed = int(get("ElapsedRaw")) if get("ElapsedRaw") else parse_elapsed(get("Elapsed"))
-            mem = parse_reqmem(get("ReqMem"), cpus, nodes) if get("ReqMem") else 0
+            mem = parse_reqmem(get("ReqMem"), cpus, nodes)
             gpus = parse_gpus(get("AllocTRES"))
         except (ValueError, FormatError) as exc:
             raise FormatError(f"{path} line {n}: {exc}") from exc
