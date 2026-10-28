@@ -1,0 +1,9 @@
+{
+  "input": "samplesheet.csv",
+  "outdir": "results",
+  "fasta": "genome.fa",
+  "gtf": "genes.gtf",
+  "aligner": "star_rsem",
+  "skip_biotype_qc": true,
+  "skip_dupradar": true
+}
