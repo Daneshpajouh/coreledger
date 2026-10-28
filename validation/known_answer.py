@@ -171,7 +171,7 @@ def part2(n_runs: int, seed: int, work: Path) -> dict:
             ledger, prun, "synthetic", out, samples,
             commit=None if defect == "NO_COMMIT" else COMMIT,
             gate=None if defect == "NO_GATE" else gate,
-            sacct=sacct, today="2026-10-28",
+            sacct=sacct, sacct_run_only=True, today="2026-10-28",
         )
         ingest.release(ledger, prun, force=defect in ("NO_GATE", "GATE_NOT_PASS"), today="2026-10-28")
         manifests[prun] = (out, manifest(out))
