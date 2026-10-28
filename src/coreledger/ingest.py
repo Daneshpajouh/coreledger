@@ -213,10 +213,23 @@ def read_samplesheet(path: Path) -> List[str]:
 
 
 def _left_out(folder: Path, inner: Sequence[Path]) -> List[str]:
-    """Files under ``folder`` that are not under any of the folders in ``inner``, relative to ``folder``."""
+    """Files under ``folder`` that are not under any of the folders in ``inner``, relative to ``folder``.
+
+    A linked folder outside ``inner`` is listed by its own name with a trailing slash: ``os.walk`` does not follow it,
+    and it is not a file, so without this the files behind it would not count.
+    """
     rest: List[str] = []
     for root, dirs, names in os.walk(folder):
-        dirs[:] = sorted(d for d in dirs if not any(Path(root, d).resolve().is_relative_to(t) for t in inner))
+        kept = []
+        for d in sorted(dirs):
+            here = Path(root, d)
+            if any(here.resolve().is_relative_to(t) for t in inner):
+                continue
+            if here.is_symlink():
+                rest.append(here.relative_to(folder).as_posix() + "/")
+                continue
+            kept.append(d)
+        dirs[:] = kept
         rest += [Path(root, n).relative_to(folder).as_posix() for n in sorted(names)]
     return rest
 
@@ -229,7 +242,7 @@ def _walk_results(outdir: Path, exclude: Sequence[str]) -> Tuple[List[Path], Lis
     whose files are recorded under their own paths; at a folder that holds the results folder
     or the target of another link in the results folder itself, when it holds nothing else; or,
     inside a linked folder, out of that folder, since a task's staged inputs belong to other tasks.
-    A link that holds another target and other files too is refused, since entering it would
+    A link that holds another target and other files or linked folders too is refused, since entering it would
     record other tasks' files and skipping it would leave files out. A plain folder is always
     entered. Only links in the results folder itself count as targets, so the outcome does not
     depend on the order of names.
@@ -266,9 +279,9 @@ def _walk_results(outdir: Path, exclude: Sequence[str]) -> Tuple[List[Path], Lis
                     if rest:
                         raise InputError(
                             f"{here.relative_to(outdir).as_posix()} holds another linked folder and {len(rest)} "
-                            f"other file(s) ({', '.join(rest[:5])}); entering it would record other tasks' files "
-                            f"and skipping it would leave these out: exclude it (--exclude {d}) or link the "
-                            "folders apart"
+                            f"other file(s) or linked folder(s) ({', '.join(rest[:5])}); entering it would record "
+                            f"other tasks' files and skipping it would leave these out: exclude it (--exclude {d}) "
+                            "or link the folders apart"
                         )
                     loops.append(here.relative_to(outdir).as_posix())
                     continue
@@ -356,6 +369,7 @@ def register_run(
     tags: Dict[str, str] = {}
     held: List[Tuple[str, str]] = []
     blank: List[Tuple[str, str, str]] = []
+    zero: List[Tuple[str, str]] = []
     cached: Set[str] = set()
     mapped: Dict[str, str] = {}
     if job_map is not None:
@@ -364,7 +378,7 @@ def register_run(
                 raise InputError(f"{job_map} line {row['_line']}: sample {row['sample_id']} is not in this run")
             mapped[row["job_id"]] = row["sample_id"]
     if sacct is not None:
-        jobs, notes = slurm.read_sacct(sacct, held, blank)
+        jobs, notes = slurm.read_sacct(sacct, held, blank, zero)
         reg.notes.extend(notes)
     if trace is not None:
         tags = slurm.read_nextflow_trace(trace, cached)
@@ -391,6 +405,8 @@ def register_run(
             "register the run after they end, so their time is billed"
         )
     listed = {j.job_id for j in jobs} | {j.alt_id for j in jobs}
+    # A zero-time line with a blank size is in the export and bills nothing; it has its own note, not "not found".
+    listed |= {i for ids in zero for i in ids if i}
     if trace is not None:
         missing = sorted(set(tags) - listed)
         if sacct is not None and missing:

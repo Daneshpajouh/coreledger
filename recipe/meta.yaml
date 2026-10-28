@@ -14,6 +14,10 @@ build:
   number: 0
   noarch: python
   script: {{ PYTHON }} -m pip install . --no-deps --no-build-isolation -vvv
+  # Bioconda's missing_run_exports lint covers Python packages and command-line tools too; a 0.x version may
+  # break in a minor release, so its case 2 pins to x.x.
+  run_exports:
+    - {{ pin_subpackage(name, max_pin="x.x") }}
   entry_points:
     - coreledger = coreledger.cli:main
 

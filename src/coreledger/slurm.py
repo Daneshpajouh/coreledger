@@ -117,6 +117,7 @@ def read_sacct(
     path: Path,
     held: Optional[List[Tuple[str, str]]] = None,
     blank: Optional[List[Tuple[str, str, str]]] = None,
+    zero: Optional[List[Tuple[str, str]]] = None,
 ) -> Tuple[List[Job], List[str]]:
     """Jobs that have finished, and notes on the lines skipped.
 
@@ -126,7 +127,8 @@ def read_sacct(
     ``blank``, if given, collects the shown and raw IDs and the reason for each finished line with
     an empty ``AllocCPUS`` or ``ReqMem`` that ran for some time, which is then left out instead of
     stopping the read, so the caller can refuse it only when it is one of its own jobs. A line with
-    a blank size that ran for no time bills nothing and is skipped with a note.
+    a blank size that ran for no time bills nothing and is skipped with a note; ``zero``, if given, collects its
+    shown and raw IDs, so a caller does not report that job as missing from the export.
     """
     notes: List[str] = []
     with open(path, newline="") as fh:
@@ -185,6 +187,8 @@ def read_sacct(
                 raise FormatError(f"{path} line {n}: {exc}") from exc
             if ran == 0:
                 notes.append(f"job {shown or job_id} skipped: {empty[0]} is empty and it ran for no time")
+                if zero is not None:
+                    zero.append((shown, job_id))
                 continue
             if blank is None:
                 raise FormatError(f"{path} line {n}: {empty[0]} is empty")

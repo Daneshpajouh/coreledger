@@ -911,7 +911,7 @@ def test_r5_link_order_does_not_decide_what_is_entered(tmp_path, ledger, wide):
     (out / "m_sample").symlink_to(store)
     (out / wide).symlink_to(tmp_path / "work")
     with pytest.raises(ingest.InputError, match=rf"{wide} holds another linked folder and 1 other file\(s\) "
-                       r"\(cd/B/other.sf\)"):
+                       r"or linked folder\(s\) \(cd/B/other.sf\)"):
         ingest.register_run(ledger, "R1", "p", out, ["A"], commit=COMMIT)
     assert ledger.one("SELECT COUNT(*) FROM results")[0] == 0
     reg = ingest.register_run(ledger, "R1", "p", out, ["A"], commit=COMMIT, exclude=("pipeline_info", wide))
@@ -1100,7 +1100,8 @@ def test_r7_a_link_holding_another_link_and_other_files_is_refused(tmp_path, led
     out = tmp_path / "o"
     (out / "A").symlink_to(store)
     (out / "A_quant").symlink_to(store / "quant")
-    with pytest.raises(ingest.InputError, match=r"^A holds another linked folder and 1 other file\(s\) \(A.bam\)"):
+    with pytest.raises(ingest.InputError,
+                       match=r"^A holds another linked folder and 1 other file\(s\) or linked folder\(s\) \(A.bam\)"):
         ingest.register_run(ledger, "R1", "p", out, ["A"], commit=COMMIT)
     assert ledger.one("SELECT COUNT(*) FROM pipeline_runs")[0] == 0
     # Holding nothing else, the outer link is still left out with a note.
@@ -1125,3 +1126,41 @@ def test_r7_a_blank_size_that_ran_for_no_time_is_noted(tmp_path, ledger):
     bad = write(tmp_path / "b.txt", "JobID|JobIDRaw|State|Elapsed|AllocCPUS|ReqMem\n909|909|CANCELLED|soon||\n")
     with pytest.raises(slurm.FormatError, match=r"line 2: "):
         ingest.register_run(ledger, "R2", "p", tmp_path / "o", ["A"], commit=COMMIT, sacct=bad, sacct_run_only=True)
+
+
+def test_r8_a_linked_folder_beside_another_target_is_not_left_out(tmp_path, ledger):
+    # A wider link that holds another link's target and, besides it, only a linked folder: os.walk does not follow
+    # that folder, so before round 8 the wider link looked empty, was skipped, and A.bam was never recorded.
+    _r3_one_sample(tmp_path, ledger)
+    write(tmp_path / "bams" / "A.bam", "bam A")
+    store = tmp_path / "work" / "A"
+    write(store / "quant" / "quant.sf", "quant A")
+    (store / "bam").symlink_to(tmp_path / "bams")
+    out = tmp_path / "o"
+    (out / "A").symlink_to(store)
+    (out / "A_quant").symlink_to(store / "quant")
+    with pytest.raises(ingest.InputError,
+                       match=r"^A holds another linked folder and 1 other file\(s\) or linked folder\(s\) \(bam/\)"):
+        ingest.register_run(ledger, "R1", "p", out, ["A"], commit=COMMIT)
+    assert ledger.one("SELECT COUNT(*) FROM pipeline_runs")[0] == 0
+    # The way out the message names: exclude the wider link.
+    reg = ingest.register_run(ledger, "R1", "p", out, ["A"], commit=COMMIT, exclude=("pipeline_info", "A"))
+    paths = [r[0] for r in ledger.query("SELECT path FROM results ORDER BY path")]
+    assert paths == ["A.txt", "A_quant/quant.sf"]
+    assert reg.notes == ["1 linked folder(s) entered: A_quant"]
+
+
+@pytest.mark.parametrize("listing", ["trace", "job_map"])
+def test_r8_a_zero_time_blank_line_is_not_reported_missing(tmp_path, ledger, listing):
+    _r3_one_sample(tmp_path, ledger)
+    sacct = write(tmp_path / "s.txt", (
+        "JobID|JobIDRaw|State|Elapsed|AllocCPUS|ReqMem\n"
+        "101|101|COMPLETED|01:00:00|4|8G\n"
+        "909|909|CANCELLED|00:00:00||\n"
+    ))
+    given = ({"trace": write(tmp_path / "t.txt", "native_id\tname\n101\tP (A)\n909\tP (A)\n")} if listing == "trace"
+             else {"job_map": write(tmp_path / "m.csv", "job_id,sample_id\n101,A\n909,A\n")})
+    reg = ingest.register_run(ledger, "R1", "p", tmp_path / "o", ["A"], commit=COMMIT, sacct=sacct, **given)
+    assert [r[0] for r in ledger.query("SELECT job_id FROM jobs")] == ["101"]
+    assert "job 909 skipped: AllocCPUS is empty and it ran for no time" in reg.notes
+    assert not [n for n in reg.notes if "not found in sacct" in n]

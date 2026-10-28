@@ -20,6 +20,10 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Bio-Informatics",
 ]
 
+[project.urls]
+Homepage = "https://github.com/Daneshpajouh/coreledger"
+Repository = "https://github.com/Daneshpajouh/coreledger"
+
 [project.scripts]
 coreledger = "coreledger.cli:main"
 
