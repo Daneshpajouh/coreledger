@@ -322,7 +322,9 @@ def register_run(
     if trace is not None or (job_map is not None and not sacct_run_only):
         # An array task's trace ID may be its JobIDRaw (301) while the range shows the parent (300_[3-10]).
         bases = {t.split("_")[0] for t in ours}
-        bases |= {i.split("_")[0] for j in jobs if j.job_id in ours or j.alt_id in ours for i in (j.job_id, j.alt_id) if i}
+        for j in jobs:
+            if j.job_id in ours or j.alt_id in ours:
+                bases |= {i.split("_")[0] for i in (j.job_id, j.alt_id) if i}
         held = [h for h in held if h.split("_")[0] in bases]
     if held:
         raise InputError(
