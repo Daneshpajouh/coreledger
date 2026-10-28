@@ -20,9 +20,8 @@ time and size.
 (https://slurm.schedmd.com/job_state_codes.html) for a job that still holds or waits for an
 allocation, such as ``COMPLETING`` (the epilog may still run) and ``CONFIGURING``.
 
-Columns used: ``JobIDRaw`` or ``JobID`` (one is required), ``Elapsed`` or ``ElapsedRaw``,
-``AllocCPUS``, ``ReqMem`` (required); ``JobID``, ``JobName``, ``State``, ``NNodes`` and
-``AllocTRES`` when present. A suitable call:
+Columns used: ``JobID``, ``State``, ``Elapsed`` or ``ElapsedRaw``, ``AllocCPUS`` and ``ReqMem``
+(required); ``JobIDRaw``, ``JobName``, ``NNodes`` and ``AllocTRES`` when present. A suitable call:
 
     sacct --parsable2 --allocations --starttime 2026-10-01 \\
         --format=JobID,JobIDRaw,JobName,State,Elapsed,AllocCPUS,NNodes,ReqMem,AllocTRES
@@ -128,9 +127,10 @@ def read_sacct(path: Path, held: Optional[List[Tuple[str, str]]] = None) -> Tupl
         raise FormatError(f"{path}: empty sacct file")
     header = lines[0].split("|")
     col = {name: i for i, name in enumerate(header)}
-    id_col = "JobIDRaw" if "JobIDRaw" in col else "JobID" if "JobID" in col else None
-    if id_col is None:
-        raise FormatError(f"{path}: needs a JobIDRaw or JobID column")
+    # JobIDRaw alone hides an array task's shown ID (300_1), which a trace may list and the catalogue keys on.
+    if "JobID" not in col:
+        raise FormatError(f"{path}: needs a JobID column (JobIDRaw alone does not show array task IDs)")
+    id_col = "JobIDRaw" if "JobIDRaw" in col else "JobID"
     for need in ("AllocCPUS", "ReqMem"):
         if need not in col:
             raise FormatError(f"{path}: needs a {need} column")

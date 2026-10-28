@@ -220,7 +220,7 @@ def test_register_is_all_or_nothing(tmp_path, core, ledger):
 
 
 def test_job_map_overrides_and_checks(tmp_path, core, ledger):
-    write(tmp_path / "s2.txt", "JobIDRaw|State|Elapsed|AllocCPUS|ReqMem\n201|COMPLETED|01:00:00|1|1G\n")
+    write(tmp_path / "s2.txt", "JobID|JobIDRaw|State|Elapsed|AllocCPUS|ReqMem\n201|201|COMPLETED|01:00:00|1|1G\n")
     write(tmp_path / "map.csv", "job_id,sample_id\n201,B\n")
     (tmp_path / "o2").mkdir()
     write(tmp_path / "o2" / "B.txt", "x")
@@ -281,7 +281,7 @@ def test_bill_reads_split_needs_every_lane(tmp_path, ledger):
     ingest.intake(ledger, tmp_path / "i.csv")
     ingest.add_sequencing(ledger, tmp_path / "l.csv")
     (tmp_path / "o").mkdir()
-    write(tmp_path / "s.txt", "JobIDRaw|State|Elapsed|AllocCPUS|ReqMem\n1|COMPLETED|01:00:00|1|1G\n")
+    write(tmp_path / "s.txt", "JobID|JobIDRaw|State|Elapsed|AllocCPUS|ReqMem\n1|1|COMPLETED|01:00:00|1|1G\n")
     ingest.register_run(ledger, "R1", "p", tmp_path / "o", ["A", "B"], sacct=tmp_path / "s.txt", sacct_run_only=True)
     card = billing.RateCard.load(write(tmp_path / "rates.json", json.dumps(RATES)))
     bill = billing.build_bill(ledger, card)
@@ -461,7 +461,9 @@ def test_sacct_skips_array_range_lines_and_bills_requeued(tmp_path):
 def test_sacct_per_node_memory_needs_nnodes(tmp_path):
     with pytest.raises(slurm.FormatError, match="NNodes"):
         slurm.read_sacct(
-            write(tmp_path / "s.txt", "JobIDRaw|State|Elapsed|AllocCPUS|ReqMem\n1|COMPLETED|01:00:00|4|16000Mn\n")
+            write(
+                tmp_path / "s.txt", "JobID|JobIDRaw|State|Elapsed|AllocCPUS|ReqMem\n1|1|COMPLETED|01:00:00|4|16000Mn\n"
+            )
         )
 
 
@@ -507,7 +509,7 @@ def test_register_notes_jobs_without_trace_or_map(tmp_path, ledger):
     write(tmp_path / "i.csv", "sample_id,project_id\nA,P1\n")
     ingest.intake(ledger, tmp_path / "i.csv")
     write(tmp_path / "o" / "A.txt", "a")
-    sacct = write(tmp_path / "s.txt", "JobIDRaw|State|Elapsed|AllocCPUS|ReqMem\n1|COMPLETED|01:00:00|4|8G\n")
+    sacct = write(tmp_path / "s.txt", "JobID|JobIDRaw|State|Elapsed|AllocCPUS|ReqMem\n1|1|COMPLETED|01:00:00|4|8G\n")
     reg = ingest.register_run(ledger, "R1", "p", tmp_path / "o", ["A"], commit=COMMIT, sacct=sacct,
                               sacct_run_only=True)
     assert reg.notes == [
@@ -540,7 +542,7 @@ def test_cli_exclude_replaces_the_default_and_bill_exits_1_on_unallocated(tmp_pa
     write(tmp_path / "i.csv", "sample_id,project_id\nA,P1\n")
     write(tmp_path / "res" / "pipeline_info" / "t.txt", "kept")
     write(tmp_path / "res" / "skip" / "A.txt", "a")
-    write(tmp_path / "sacct.txt", "JobIDRaw|State|Elapsed|AllocCPUS|ReqMem\n1|COMPLETED|01:00:00|4|8G\n")
+    write(tmp_path / "sacct.txt", "JobID|JobIDRaw|State|Elapsed|AllocCPUS|ReqMem\n1|1|COMPLETED|01:00:00|4|8G\n")
     write(tmp_path / "rates.json", json.dumps(RATES))
     assert main(["init", dbp]) == 0
     assert main(["intake", dbp, str(tmp_path / "i.csv")]) == 0
@@ -638,7 +640,7 @@ def test_r2_contrast_job_tag_is_shared(tmp_path, ledger):
     write(tmp_path / "i.csv", "sample_id,project_id\nWT_REP1,P1\nKO_REP1,P1\n")
     ingest.intake(ledger, tmp_path / "i.csv")
     write(tmp_path / "o" / "x.txt", "x")
-    sacct = write(tmp_path / "s.txt", "JobIDRaw|State|Elapsed|AllocCPUS|ReqMem\n7|COMPLETED|01:00:00|1|1G\n")
+    sacct = write(tmp_path / "s.txt", "JobID|JobIDRaw|State|Elapsed|AllocCPUS|ReqMem\n7|7|COMPLETED|01:00:00|1|1G\n")
     trace = write(tmp_path / "t.txt", "native_id\tname\n7\tDESEQ2 (KO_REP1_vs_WT_REP1)\n")
     ingest.register_run(ledger, "R1", "p", tmp_path / "o", ["WT_REP1", "KO_REP1"], commit=COMMIT,
                         sacct=sacct, trace=trace)
@@ -651,8 +653,8 @@ def test_r2_blank_reads_unallocate_one_run_and_bill_the_rest(tmp_path, capsys):
     write(tmp_path / "l.csv", "sample_id,run_id,lane,reads\nA,RUN1,1,10\nB,RUN1,1,\nC,RUN1,2,5\n")
     write(tmp_path / "o1" / "x.txt", "x")
     write(tmp_path / "o2" / "y.txt", "y")
-    write(tmp_path / "s1.txt", "JobIDRaw|State|Elapsed|AllocCPUS|ReqMem\n1|COMPLETED|01:00:00|1|1G\n")
-    write(tmp_path / "s2.txt", "JobIDRaw|State|Elapsed|AllocCPUS|ReqMem\n2|COMPLETED|01:00:00|1|1G\n")
+    write(tmp_path / "s1.txt", "JobID|JobIDRaw|State|Elapsed|AllocCPUS|ReqMem\n1|1|COMPLETED|01:00:00|1|1G\n")
+    write(tmp_path / "s2.txt", "JobID|JobIDRaw|State|Elapsed|AllocCPUS|ReqMem\n2|2|COMPLETED|01:00:00|1|1G\n")
     write(tmp_path / "rates.json", json.dumps(RATES))
     assert main(["init", dbp]) == 0
     assert main(["intake", dbp, str(tmp_path / "i.csv")]) == 0
@@ -982,3 +984,10 @@ def test_r5_one_array_task_has_one_key_with_or_without_jobidraw(tmp_path, ledger
     with pytest.raises(ingest.InputError, match=r"Slurm job 300_1 is already recorded for pipeline run R1"):
         ingest.register_run(ledger, "R2", "p", tmp_path / "o2", ["A"], commit=COMMIT, sacct=shown_only,
                             sacct_run_only=True)
+
+
+def test_r6_sacct_without_jobid_is_refused(tmp_path):
+    # JobIDRaw alone shows 301 for the array task a trace lists as 300_1, so neither the trace nor the key could match.
+    sacct = write(tmp_path / "s.txt", "JobIDRaw|State|Elapsed|AllocCPUS|ReqMem\n301|COMPLETED|01:00:00|4|8G\n")
+    with pytest.raises(slurm.FormatError, match="needs a JobID column"):
+        slurm.read_sacct(sacct)

@@ -166,7 +166,9 @@ def part2(n_runs: int, seed: int, work: Path) -> dict:
         gate = work / f"{prun}_gate.json"
         gate.write_text(json.dumps({"verdict": "FAIL" if defect == "GATE_NOT_PASS" else "PASS"}))
         sacct = work / f"{prun}_sacct.txt"
-        sacct.write_text("JobIDRaw|State|Elapsed|AllocCPUS|ReqMem\n" + f"{prun}J1|COMPLETED|01:00:00|2|4G\n")
+        sacct.write_text(
+            "JobID|JobIDRaw|State|Elapsed|AllocCPUS|ReqMem\n" + f"{prun}J1|{prun}J1|COMPLETED|01:00:00|2|4G\n"
+        )
         ingest.register_run(
             ledger, prun, "synthetic", out, samples,
             commit=None if defect == "NO_COMMIT" else COMMIT,
