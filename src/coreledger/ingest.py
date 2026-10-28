@@ -212,24 +212,33 @@ def read_samplesheet(path: Path) -> List[str]:
     return out
 
 
+def _left_out(folder: Path, inner: Sequence[Path]) -> List[str]:
+    """Files under ``folder`` that are not under any of the folders in ``inner``, relative to ``folder``."""
+    rest: List[str] = []
+    for root, dirs, names in os.walk(folder):
+        dirs[:] = sorted(d for d in dirs if not any(Path(root, d).resolve().is_relative_to(t) for t in inner))
+        rest += [Path(root, n).relative_to(folder).as_posix() for n in sorted(names)]
+    return rest
+
+
 def _walk_results(outdir: Path, exclude: Sequence[str]) -> Tuple[List[Path], List[str], List[str]]:
     """The result files under ``outdir``, the linked folders entered and the links not entered.
 
     Linked folders are entered (nf-core publishDir mode symlink). A link is not entered when it
     points back to a folder already on the way down, so a loop ends; into the results folder,
     whose files are recorded under their own paths; at a folder that holds the results folder
-    or the target of another link in the results folder itself, since that folder's other files
-    belong to other tasks; or, inside a linked folder, out of that folder, since a task's staged
-    inputs belong to other tasks. A plain folder is always entered. Only links in the results
-    folder itself count as targets, so the outcome does not depend on the order of names.
+    or the target of another link in the results folder itself, when it holds nothing else; or,
+    inside a linked folder, out of that folder, since a task's staged inputs belong to other tasks.
+    A link that holds another target and other files too is refused, since entering it would
+    record other tasks' files and skipping it would leave files out. A plain folder is always
+    entered. Only links in the results folder itself count as targets, so the outcome does not
+    depend on the order of names.
     """
     top = outdir.resolve()
     targets: Set[Path] = set()
-    for root, dirs, _ in os.walk(outdir):
-        dirs[:] = [d for d in dirs if d not in exclude]
-        for d in dirs:
-            here = Path(root, d)
-            if here.is_symlink() and not here.resolve().is_relative_to(top):
+    for here in outdir.iterdir():
+        if here.name not in exclude and here.is_symlink() and here.is_dir():
+            if not here.resolve().is_relative_to(top):
                 targets.add(here.resolve())
     files: List[Path] = []
     linked: List[str] = []
@@ -247,9 +256,20 @@ def _walk_results(outdir: Path, exclude: Sequence[str]) -> Tuple[List[Path], Lis
             store[here] = inside
             if here.is_symlink():
                 holds = real != top and top.is_relative_to(real)
-                holds = holds or any(t != real and t.is_relative_to(real) for t in targets)
                 leaves = inside is not None and not real.is_relative_to(inside)
                 if real in above[Path(root)] or real.is_relative_to(top) or holds or leaves:
+                    loops.append(here.relative_to(outdir).as_posix())
+                    continue
+                inner = [t for t in targets if t != real and t.is_relative_to(real)]
+                if inner:
+                    rest = _left_out(real, inner)
+                    if rest:
+                        raise InputError(
+                            f"{here.relative_to(outdir).as_posix()} holds another linked folder and {len(rest)} "
+                            f"other file(s) ({', '.join(rest[:5])}); entering it would record other tasks' files "
+                            f"and skipping it would leave these out: exclude it (--exclude {d}) or link the "
+                            "folders apart"
+                        )
                     loops.append(here.relative_to(outdir).as_posix())
                     continue
                 linked.append(here.relative_to(outdir).as_posix())
