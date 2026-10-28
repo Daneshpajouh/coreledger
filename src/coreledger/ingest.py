@@ -274,8 +274,10 @@ def register_run(
     linked_dirs = []
     loops = []
     # Linked folders are entered (nf-core publishDir mode symlink); a link back to a folder
-    # already on the way down is not, so a loop ends.
+    # already on the way down is not, so a loop ends, and neither is a link to a folder that
+    # holds the output folder or a linked folder already entered, whose other files are not ours.
     above = {outdir: frozenset({outdir.resolve()})}
+    entered = {outdir.resolve()}
     for root, dirs, names in os.walk(outdir, followlinks=True):
         kept_dirs = []
         for d in sorted(dirs):
@@ -283,12 +285,13 @@ def register_run(
                 continue
             here = Path(root, d)
             real = here.resolve()
-            if real in above[Path(root)]:
+            if real in above[Path(root)] or any(real != a and a.is_relative_to(real) for a in entered):
                 loops.append(here.relative_to(outdir).as_posix())
                 continue
             above[here] = above[Path(root)] | {real}
             kept_dirs.append(d)
             if here.is_symlink():
+                entered.add(real)
                 linked_dirs.append(here.relative_to(outdir).as_posix())
         dirs[:] = kept_dirs
         for name in sorted(names):
@@ -300,12 +303,12 @@ def register_run(
     if linked_dirs:
         reg.notes.append(f"{len(linked_dirs)} linked folder(s) entered: {', '.join(linked_dirs[:5])}")
     if loops:
-        reg.notes.append(f"{len(loops)} link(s) back to a folder above them not entered again: "
+        reg.notes.append(f"{len(loops)} link(s) to a folder above them or above a linked folder not entered: "
                          f"{', '.join(loops[:5])}")
 
     jobs: List[slurm.Job] = []
     tags: Dict[str, str] = {}
-    held: List[str] = []
+    held: List[Tuple[str, str]] = []
     cached: Set[str] = set()
     mapped: Dict[str, str] = {}
     if job_map is not None:
@@ -319,26 +322,33 @@ def register_run(
     if trace is not None:
         tags = slurm.read_nextflow_trace(trace, cached)
     ours = set(tags) | set(mapped)
-    if trace is not None or (job_map is not None and not sacct_run_only):
-        # An array task's trace ID may be its JobIDRaw (301) while the range shows the parent (300_[3-10]).
+    if not sacct_run_only and (trace is not None or job_map is not None):
+        # An array task's trace ID may be its JobIDRaw (301) while the range shows the parent (300_[3-10]),
+        # and a task not yet started is listed by either ID (300_1 or 301).
         bases = {t.split("_")[0] for t in ours}
         for j in jobs:
             if j.job_id in ours or j.alt_id in ours:
                 bases |= {i.split("_")[0] for i in (j.job_id, j.alt_id) if i}
-        held = [h for h in held if h.split("_")[0] in bases]
+        for ids in held:
+            if any(i in ours for i in ids if i):
+                bases |= {i.split("_")[0] for i in ids if i}
+        held = [(s, r) for s, r in held if (s or r).split("_")[0] in bases]
     if held:
+        shown = [s or r for s, r in held]
         raise InputError(
-            f"{len(held)} Slurm job(s) of this run have not finished ({', '.join(held[:5])}); "
+            f"{len(held)} Slurm job(s) of this run have not finished ({', '.join(shown[:5])}); "
             "register the run after they end, so their time is billed"
         )
     if trace is not None:
-        kept = [j for j in jobs if j.job_id in tags or j.alt_id in tags]
-        if sacct is not None and len(kept) != len(jobs):
-            reg.notes.append(f"{len(jobs) - len(kept)} sacct job(s) not in the trace were left out")
-        listed = {j.job_id for j in kept} | {j.alt_id for j in kept}
+        listed = {j.job_id for j in jobs} | {j.alt_id for j in jobs}
         missing = sorted(set(tags) - listed)
         if sacct is not None and missing:
             reg.notes.append(f"{len(missing)} trace job(s) not found in sacct: {', '.join(missing[:5])}")
+    if trace is not None and not sacct_run_only:
+        kept = [j for j in jobs if j.job_id in tags or j.alt_id in tags]
+        if sacct is not None and len(kept) != len(jobs):
+            reg.notes.append(f"{len(jobs) - len(kept)} sacct job(s) not in the trace were left out "
+                             "(--sacct-run-only keeps them, shared across the run's samples)")
         jobs = kept
     elif job_map is not None and not sacct_run_only:
         kept = [j for j in jobs if j.job_id in mapped or j.alt_id in mapped]
@@ -348,6 +358,11 @@ def register_run(
         jobs = kept
     if jobs and trace is None and job_map is None:
         reg.notes.append("no --trace or --job-map: every Slurm job is shared across the run's samples")
+    if sacct_run_only and (trace is not None or job_map is not None):
+        extra = [j for j in jobs if j.job_id not in ours and j.alt_id not in ours]
+        if extra:
+            reg.notes.append(f"{len(extra)} sacct job(s) not in the trace or job map were kept, "
+                             "shared across the run's samples (--sacct-run-only)")
 
     two = []
     for p in files:

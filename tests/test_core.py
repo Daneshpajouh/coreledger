@@ -118,7 +118,7 @@ def test_read_sacct_array_job_keeps_both_ids(tmp_path):
 
 def test_read_sacct_refuses_ragged_line(tmp_path):
     with pytest.raises(slurm.FormatError, match="line 2"):
-        slurm.read_sacct(write(tmp_path / "s.txt", "JobID|Elapsed|AllocCPUS|ReqMem\n1|01:00|1\n"))
+        slurm.read_sacct(write(tmp_path / "s.txt", "JobID|State|Elapsed|AllocCPUS|ReqMem\n1|COMPLETED|01:00|1\n"))
 
 
 def test_read_sacct_needs_columns(tmp_path):
@@ -186,7 +186,8 @@ def test_sample_for_path(path, expected):
 
 def test_register_records_results_jobs_and_gate(core, ledger):
     assert (core.results, core.per_sample, core.jobs, core.jobs_per_sample) == (3, 2, 3, 2)
-    assert "1 sacct job(s) not in the trace were left out" in core.notes
+    assert "1 sacct job(s) not in the trace were left out (--sacct-run-only keeps them, " \
+        "shared across the run's samples)" in core.notes
     rows = ledger.query("SELECT path, sample_id FROM results ORDER BY path")
     assert rows == [
         ("fastqc/A_fastqc.html", "A"), ("fastqc/B_fastqc.html", "B"), ("multiqc/multiqc_report.html", None)
@@ -219,7 +220,7 @@ def test_register_is_all_or_nothing(tmp_path, core, ledger):
 
 
 def test_job_map_overrides_and_checks(tmp_path, core, ledger):
-    write(tmp_path / "s2.txt", "JobIDRaw|Elapsed|AllocCPUS|ReqMem\n201|01:00:00|1|1G\n")
+    write(tmp_path / "s2.txt", "JobIDRaw|State|Elapsed|AllocCPUS|ReqMem\n201|COMPLETED|01:00:00|1|1G\n")
     write(tmp_path / "map.csv", "job_id,sample_id\n201,B\n")
     (tmp_path / "o2").mkdir()
     write(tmp_path / "o2" / "B.txt", "x")
@@ -280,7 +281,7 @@ def test_bill_reads_split_needs_every_lane(tmp_path, ledger):
     ingest.intake(ledger, tmp_path / "i.csv")
     ingest.add_sequencing(ledger, tmp_path / "l.csv")
     (tmp_path / "o").mkdir()
-    write(tmp_path / "s.txt", "JobIDRaw|Elapsed|AllocCPUS|ReqMem\n1|01:00:00|1|1G\n")
+    write(tmp_path / "s.txt", "JobIDRaw|State|Elapsed|AllocCPUS|ReqMem\n1|COMPLETED|01:00:00|1|1G\n")
     ingest.register_run(ledger, "R1", "p", tmp_path / "o", ["A", "B"], sacct=tmp_path / "s.txt", sacct_run_only=True)
     card = billing.RateCard.load(write(tmp_path / "rates.json", json.dumps(RATES)))
     bill = billing.build_bill(ledger, card)
@@ -459,7 +460,9 @@ def test_sacct_skips_array_range_lines_and_bills_requeued(tmp_path):
 
 def test_sacct_per_node_memory_needs_nnodes(tmp_path):
     with pytest.raises(slurm.FormatError, match="NNodes"):
-        slurm.read_sacct(write(tmp_path / "s.txt", "JobIDRaw|Elapsed|AllocCPUS|ReqMem\n1|01:00:00|4|16000Mn\n"))
+        slurm.read_sacct(
+            write(tmp_path / "s.txt", "JobIDRaw|State|Elapsed|AllocCPUS|ReqMem\n1|COMPLETED|01:00:00|4|16000Mn\n")
+        )
 
 
 def test_reqmem_fraction_is_exact():
@@ -504,7 +507,7 @@ def test_register_notes_jobs_without_trace_or_map(tmp_path, ledger):
     write(tmp_path / "i.csv", "sample_id,project_id\nA,P1\n")
     ingest.intake(ledger, tmp_path / "i.csv")
     write(tmp_path / "o" / "A.txt", "a")
-    sacct = write(tmp_path / "s.txt", "JobIDRaw|Elapsed|AllocCPUS|ReqMem\n1|01:00:00|4|8G\n")
+    sacct = write(tmp_path / "s.txt", "JobIDRaw|State|Elapsed|AllocCPUS|ReqMem\n1|COMPLETED|01:00:00|4|8G\n")
     reg = ingest.register_run(ledger, "R1", "p", tmp_path / "o", ["A"], commit=COMMIT, sacct=sacct,
                               sacct_run_only=True)
     assert reg.notes == [
@@ -537,7 +540,7 @@ def test_cli_exclude_replaces_the_default_and_bill_exits_1_on_unallocated(tmp_pa
     write(tmp_path / "i.csv", "sample_id,project_id\nA,P1\n")
     write(tmp_path / "res" / "pipeline_info" / "t.txt", "kept")
     write(tmp_path / "res" / "skip" / "A.txt", "a")
-    write(tmp_path / "sacct.txt", "JobIDRaw|Elapsed|AllocCPUS|ReqMem\n1|01:00:00|4|8G\n")
+    write(tmp_path / "sacct.txt", "JobIDRaw|State|Elapsed|AllocCPUS|ReqMem\n1|COMPLETED|01:00:00|4|8G\n")
     write(tmp_path / "rates.json", json.dumps(RATES))
     assert main(["init", dbp]) == 0
     assert main(["intake", dbp, str(tmp_path / "i.csv")]) == 0
@@ -648,8 +651,8 @@ def test_r2_blank_reads_unallocate_one_run_and_bill_the_rest(tmp_path, capsys):
     write(tmp_path / "l.csv", "sample_id,run_id,lane,reads\nA,RUN1,1,10\nB,RUN1,1,\nC,RUN1,2,5\n")
     write(tmp_path / "o1" / "x.txt", "x")
     write(tmp_path / "o2" / "y.txt", "y")
-    write(tmp_path / "s1.txt", "JobIDRaw|Elapsed|AllocCPUS|ReqMem\n1|01:00:00|1|1G\n")
-    write(tmp_path / "s2.txt", "JobIDRaw|Elapsed|AllocCPUS|ReqMem\n2|01:00:00|1|1G\n")
+    write(tmp_path / "s1.txt", "JobIDRaw|State|Elapsed|AllocCPUS|ReqMem\n1|COMPLETED|01:00:00|1|1G\n")
+    write(tmp_path / "s2.txt", "JobIDRaw|State|Elapsed|AllocCPUS|ReqMem\n2|COMPLETED|01:00:00|1|1G\n")
     write(tmp_path / "rates.json", json.dumps(RATES))
     assert main(["init", dbp]) == 0
     assert main(["intake", dbp, str(tmp_path / "i.csv")]) == 0
@@ -709,11 +712,17 @@ def test_r3_finished_array_range_does_not_block(tmp_path, ledger, state):
     assert reg.jobs == 1
 
 
-def test_r3_array_range_without_state_is_held(tmp_path, ledger):
+def test_r4_sacct_without_a_state_is_refused(tmp_path, ledger):
     _r3_one_sample(tmp_path, ledger)
-    sacct = write(tmp_path / "s.txt", "JobID|JobIDRaw|Elapsed|AllocCPUS|ReqMem\n300_[3-10]|300|00:00:00|0|4G\n")
-    with pytest.raises(ingest.InputError, match="have not finished"):
-        ingest.register_run(ledger, "R1", "p", tmp_path / "o", ["A"], commit=COMMIT, sacct=sacct, sacct_run_only=True)
+    no_column = write(tmp_path / "s.txt", "JobID|JobIDRaw|Elapsed|AllocCPUS|ReqMem\n101|101|00:10:00|4|8G\n")
+    with pytest.raises(slurm.FormatError, match="needs a State column"):
+        ingest.register_run(
+            ledger, "R1", "p", tmp_path / "o", ["A"], commit=COMMIT, sacct=no_column, sacct_run_only=True
+        )
+    blank = write(tmp_path / "b.txt", "JobID|JobIDRaw|State|Elapsed|AllocCPUS|ReqMem\n300_[3-10]|300||00:00:00|0|4G\n")
+    with pytest.raises(slurm.FormatError, match="line 2: State is empty"):
+        ingest.register_run(ledger, "R1", "p", tmp_path / "o", ["A"], commit=COMMIT, sacct=blank, sacct_run_only=True)
+    assert ledger.one("SELECT COUNT(*) FROM jobs")[0] == 0
 
 
 def test_r3_open_range_blocks_when_the_trace_has_raw_task_ids(tmp_path, ledger):
@@ -743,8 +752,8 @@ def test_r3_linked_sample_folders_are_entered_and_loops_end(tmp_path, ledger):
     assert [(r[0], r[1]) for r in rows] == [("A.txt", "A"), ("again/quant.sf", None), ("salmon/A/quant.sf", "A")]
     assert rows[2][2] == ingest.sha256_file(store / "quant.sf")
     assert reg.notes == [
-        "4 linked folder(s) entered: again, again/up, salmon/A, salmon/A/up",
-        "3 link(s) back to a folder above them not entered again: again/up/A, salmon/loop, salmon/A/up/A",
+        "2 linked folder(s) entered: again, salmon/A",
+        "3 link(s) to a folder above them or above a linked folder not entered: again/up, salmon/loop, salmon/A/up",
     ]
 
 
@@ -825,3 +834,62 @@ def test_r3_cli_reports_a_duplicate_lane_without_a_traceback(tmp_path, capsys):
     assert main(["sequencing", dbp, str(tmp_path / "l.csv")]) == 2
     assert "the catalogue refused the change, so nothing was written" in capsys.readouterr().err
     assert db.connect(dbp).query("SELECT * FROM sample_runs") == []
+
+
+def test_r4_pending_task_listed_by_raw_id_is_held(tmp_path, ledger):
+    _r3_one_sample(tmp_path, ledger)
+    sacct = write(tmp_path / "s.txt", (
+        "JobID|JobIDRaw|State|Elapsed|AllocCPUS|ReqMem\n"
+        "300_1|301|PENDING|00:00:00|0|4G\n"
+        "300_[3-10]|300|PENDING|00:00:00|0|4G\n"
+    ))
+    trace = write(tmp_path / "t.txt", "native_id\tname\n301\tP (A)\n")
+    with pytest.raises(ingest.InputError, match=r"2 Slurm job\(s\) .* not finished \(300_1, 300_\[3-10\]\)"):
+        ingest.register_run(ledger, "R1", "p", tmp_path / "o", ["A"], commit=COMMIT, sacct=sacct, trace=trace)
+    # Someone else's pending job is still not ours.
+    other = write(
+        tmp_path / "s2.txt", "JobID|JobIDRaw|State|Elapsed|AllocCPUS|ReqMem\n400_1|401|PENDING|00:00:00|0|4G\n"
+    )
+    reg = ingest.register_run(ledger, "R1", "p", tmp_path / "o", ["A"], commit=COMMIT, sacct=other, trace=trace)
+    assert reg.jobs == 0
+
+
+def test_r4_link_to_a_folder_holding_ours_is_not_entered(tmp_path, ledger):
+    _r3_one_sample(tmp_path, ledger)
+    store = tmp_path / "work" / "A"
+    write(store / "quant.sf", "quant A")
+    write(tmp_path / "work" / "B" / "other.sf", "another task's file")
+    out = tmp_path / "o"
+    (out / "again").symlink_to(store)
+    (store / "up").symlink_to(store.parent)
+    (out / "top").symlink_to(tmp_path)
+    reg = ingest.register_run(ledger, "R1", "p", out, ["A"], commit=COMMIT)
+    paths = [r[0] for r in ledger.query("SELECT path FROM results ORDER BY path")]
+    assert paths == ["A.txt", "again/quant.sf"]
+    assert reg.notes == [
+        "1 linked folder(s) entered: again",
+        "2 link(s) to a folder above them or above a linked folder not entered: top, again/up",
+    ]
+
+
+def test_r4_sacct_run_only_keeps_jobs_outside_the_trace(tmp_path, ledger):
+    _r3_one_sample(tmp_path, ledger)
+    sacct = write(tmp_path / "s.txt", (
+        "JobID|JobIDRaw|State|Elapsed|AllocCPUS|ReqMem\n"
+        "101|101|COMPLETED|01:00:00|4|8G\n"
+        "103|103|COMPLETED|02:00:00|1|2G\n"
+    ))
+    trace = write(tmp_path / "t.txt", "native_id\tname\n101\tP (A)\n")
+    reg = ingest.register_run(ledger, "R1", "p", tmp_path / "o", ["A"], commit=COMMIT, sacct=sacct, trace=trace,
+                              sacct_run_only=True)
+    rows = ledger.query("SELECT job_id, sample_id FROM jobs ORDER BY job_id")
+    assert [tuple(r) for r in rows] == [("101", "A"), ("103", None)]
+    assert "1 sacct job(s) not in the trace or job map were kept, shared across the run's samples " \
+        "(--sacct-run-only)" in reg.notes
+    # A job of this file still running blocks the run, in the trace or not.
+    running = write(
+        tmp_path / "s2.txt", "JobID|JobIDRaw|State|Elapsed|AllocCPUS|ReqMem\n104|104|RUNNING|00:10:00|1|2G\n"
+    )
+    with pytest.raises(ingest.InputError, match=r"not finished \(104\)"):
+        ingest.register_run(ledger, "R2", "p", tmp_path / "o", ["A"], commit=COMMIT, sacct=running, trace=trace,
+                            sacct_run_only=True)

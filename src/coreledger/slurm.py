@@ -108,11 +108,12 @@ def parse_gpus(tres: str) -> int:
     return plain if plain is not None else typed
 
 
-def read_sacct(path: Path, held: Optional[List[str]] = None) -> Tuple[List[Job], List[str]]:
+def read_sacct(path: Path, held: Optional[List[Tuple[str, str]]] = None) -> Tuple[List[Job], List[str]]:
     """Jobs that have finished, and notes on the lines skipped.
 
-    ``held``, if given, collects the IDs of lines skipped because they have not finished: a job
-    still pending or running, or an array range whose tasks have not started (``1001_[3-10]``).
+    ``held``, if given, collects the shown and raw IDs of lines skipped because they have not
+    finished: a job still pending or running (``1001_1``, ``1002``), or an array range whose
+    tasks have not started (``1001_[3-10]``, ``1001``).
     """
     notes: List[str] = []
     with open(path, newline="") as fh:
@@ -129,6 +130,9 @@ def read_sacct(path: Path, held: Optional[List[str]] = None) -> Tuple[List[Job],
             raise FormatError(f"{path}: needs a {need} column")
     if "ElapsedRaw" not in col and "Elapsed" not in col:
         raise FormatError(f"{path}: needs an Elapsed or ElapsedRaw column")
+    # Without a state a running job would be billed as finished.
+    if "State" not in col:
+        raise FormatError(f"{path}: needs a State column")
 
     jobs: List[Job] = []
     records: Dict[str, int] = {}
@@ -145,15 +149,17 @@ def read_sacct(path: Path, held: Optional[List[str]] = None) -> Tuple[List[Job],
         if "." in job_id or "." in shown:
             continue
         state = get("State").split(" ")[0]
+        if not state:
+            raise FormatError(f"{path} line {n}: State is empty")
         if "[" in job_id or "[" in shown:
             notes.append(f"job {shown or job_id} skipped: an array line that covers a range of tasks")
-            if (state in NOT_FINISHED or not state) and held is not None:
-                held.append(shown or job_id)
+            if state in NOT_FINISHED and held is not None:
+                held.append((shown, job_id))
             continue
         if state in NOT_FINISHED:
             notes.append(f"job {job_id} skipped: state {state}")
             if held is not None:
-                held.append(shown or job_id)
+                held.append((shown, job_id))
             continue
         try:
             cpus = int(get("AllocCPUS") or 0)
