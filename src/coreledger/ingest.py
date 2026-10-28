@@ -272,8 +272,10 @@ def register_run(
 
     files = []
     linked_dirs = []
-    twice = []
-    seen = {outdir.resolve()}
+    loops = []
+    # Linked folders are entered (nf-core publishDir mode symlink); a link back to a folder
+    # already on the way down is not, so a loop ends.
+    above = {outdir: frozenset({outdir.resolve()})}
     for root, dirs, names in os.walk(outdir, followlinks=True):
         kept_dirs = []
         for d in sorted(dirs):
@@ -281,10 +283,10 @@ def register_run(
                 continue
             here = Path(root, d)
             real = here.resolve()
-            if real in seen:
-                twice.append(here.relative_to(outdir).as_posix())
+            if real in above[Path(root)]:
+                loops.append(here.relative_to(outdir).as_posix())
                 continue
-            seen.add(real)
+            above[here] = above[Path(root)] | {real}
             kept_dirs.append(d)
             if here.is_symlink():
                 linked_dirs.append(here.relative_to(outdir).as_posix())
@@ -297,9 +299,9 @@ def register_run(
                 raise InputError(f"{p} is a link that does not point at a file; the result it stood for is gone")
     if linked_dirs:
         reg.notes.append(f"{len(linked_dirs)} linked folder(s) entered: {', '.join(linked_dirs[:5])}")
-    if twice:
-        reg.notes.append(f"{len(twice)} folder(s) reached a second time by a link, entered once: "
-                         f"{', '.join(twice[:5])}")
+    if loops:
+        reg.notes.append(f"{len(loops)} link(s) back to a folder above them not entered again: "
+                         f"{', '.join(loops[:5])}")
 
     jobs: List[slurm.Job] = []
     tags: Dict[str, str] = {}

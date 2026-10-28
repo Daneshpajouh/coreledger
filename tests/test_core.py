@@ -666,3 +666,162 @@ def test_r2_blank_reads_unallocate_one_run_and_bill_the_rest(tmp_path, capsys):
     assert "unallocated: job 1" in printed and "note: R1: shared jobs unallocated" in printed
     assert "P2,C," in (tmp_path / "b" / "samples.csv").read_text()
 
+
+
+def _r3_one_sample(tmp_path, ledger):
+    write(tmp_path / "i.csv", "sample_id,project_id\nA,P1\n")
+    ingest.intake(ledger, tmp_path / "i.csv")
+    write(tmp_path / "o" / "A.txt", "a")
+
+
+def test_r3_resized_job_bills_both_records(tmp_path, ledger):
+    _r3_one_sample(tmp_path, ledger)
+    sacct = write(tmp_path / "s.txt", (
+        "JobID|JobIDRaw|State|Elapsed|AllocCPUS|ReqMem\n"
+        "500|500|RESIZING|01:00:00|8|8G\n"
+        "500|500|COMPLETED|02:00:00|4|8G\n"
+    ))
+    trace = write(tmp_path / "t.txt", "native_id\tname\n500\tP (A)\n")
+    reg = ingest.register_run(ledger, "R1", "p", tmp_path / "o", ["A"], commit=COMMIT, sacct=sacct, trace=trace)
+    assert reg.jobs == 2
+    assert ledger.query("SELECT job_id, state, elapsed_s, alloc_cpus, sample_id FROM jobs ORDER BY job_id") == [
+        ("500", "RESIZING", 3600, 8, "A"), ("500#2", "COMPLETED", 7200, 4, "A"),
+    ]
+
+
+@pytest.mark.parametrize("state", ["COMPLETING", "CONFIGURING", "STOPPED"])
+def test_r3_jobs_that_can_still_add_time_are_held(tmp_path, ledger, state):
+    _r3_one_sample(tmp_path, ledger)
+    sacct = write(tmp_path / "s.txt", f"JobID|JobIDRaw|State|Elapsed|AllocCPUS|ReqMem\n9|9|{state}|00:10:00|2|4G\n")
+    with pytest.raises(ingest.InputError, match=r"not finished \(9\)"):
+        ingest.register_run(ledger, "R1", "p", tmp_path / "o", ["A"], commit=COMMIT, sacct=sacct, sacct_run_only=True)
+
+
+@pytest.mark.parametrize("state", ["FAILED", "TIMEOUT", "COMPLETED", "CANCELLED"])
+def test_r3_finished_array_range_does_not_block(tmp_path, ledger, state):
+    _r3_one_sample(tmp_path, ledger)
+    sacct = write(tmp_path / "s.txt", (
+        "JobID|JobIDRaw|State|Elapsed|AllocCPUS|ReqMem\n"
+        f"300_[3-10]|300|{state}|00:00:00|0|4G\n"
+        "300_1|301|COMPLETED|00:10:00|2|4G\n"
+    ))
+    reg = ingest.register_run(ledger, "R1", "p", tmp_path / "o", ["A"], commit=COMMIT, sacct=sacct, sacct_run_only=True)
+    assert reg.jobs == 1
+
+
+def test_r3_array_range_without_state_is_held(tmp_path, ledger):
+    _r3_one_sample(tmp_path, ledger)
+    sacct = write(tmp_path / "s.txt", "JobID|JobIDRaw|Elapsed|AllocCPUS|ReqMem\n300_[3-10]|300|00:00:00|0|4G\n")
+    with pytest.raises(ingest.InputError, match="have not finished"):
+        ingest.register_run(ledger, "R1", "p", tmp_path / "o", ["A"], commit=COMMIT, sacct=sacct, sacct_run_only=True)
+
+
+def test_r3_open_range_blocks_when_the_trace_has_raw_task_ids(tmp_path, ledger):
+    _r3_one_sample(tmp_path, ledger)
+    sacct = write(tmp_path / "s.txt", (
+        "JobID|JobIDRaw|State|Elapsed|AllocCPUS|ReqMem\n"
+        "300_1|301|COMPLETED|00:10:00|2|4G\n"
+        "300_[3-10]|300|RUNNING|00:00:00|0|4G\n"
+    ))
+    trace = write(tmp_path / "t.txt", "native_id\tname\n301\tP (A)\n")
+    with pytest.raises(ingest.InputError, match=r"not finished \(300_\[3-10\]\)"):
+        ingest.register_run(ledger, "R1", "p", tmp_path / "o", ["A"], commit=COMMIT, sacct=sacct, trace=trace)
+
+
+def test_r3_linked_sample_folders_are_entered_and_loops_end(tmp_path, ledger):
+    _r3_one_sample(tmp_path, ledger)
+    store = tmp_path / "work" / "A"
+    write(store / "quant.sf", "quant A")
+    out = tmp_path / "o"
+    (out / "salmon").mkdir(parents=True)
+    (out / "salmon" / "A").symlink_to(store)
+    (out / "again").symlink_to(store)
+    (out / "salmon" / "loop").symlink_to(out / "salmon")
+    (store / "up").symlink_to(store.parent)
+    reg = ingest.register_run(ledger, "R1", "p", out, ["A"], commit=COMMIT)
+    rows = ledger.query("SELECT path, sample_id, sha256 FROM results ORDER BY path")
+    assert [(r[0], r[1]) for r in rows] == [("A.txt", "A"), ("again/quant.sf", None), ("salmon/A/quant.sf", "A")]
+    assert rows[2][2] == ingest.sha256_file(store / "quant.sf")
+    assert reg.notes == [
+        "4 linked folder(s) entered: again, again/up, salmon/A, salmon/A/up",
+        "3 link(s) back to a folder above them not entered again: again/up/A, salmon/loop, salmon/A/up/A",
+    ]
+
+
+def test_r3_broken_folder_link_is_refused(tmp_path, ledger):
+    _r3_one_sample(tmp_path, ledger)
+    (tmp_path / "o" / "gone").symlink_to(tmp_path / "missing")
+    with pytest.raises(ingest.InputError, match="does not point at a file"):
+        ingest.register_run(ledger, "R1", "p", tmp_path / "o", ["A"], commit=COMMIT)
+    assert ledger.query("SELECT * FROM pipeline_runs") == []
+
+
+def test_r3_wide_sacct_needs_a_trace_a_job_map_or_run_only(tmp_path, ledger):
+    _r3_one_sample(tmp_path, ledger)
+    sacct = write(tmp_path / "s.txt", (
+        "JobID|JobIDRaw|JobName|State|Elapsed|AllocCPUS|ReqMem\n"
+        "7|7|ours|COMPLETED|01:00:00|2|4G\n"
+        "8811299|8811299|someone_elses_job|COMPLETED|10:00:00|32|64G\n"
+        "8811300|8811300|someone_elses_job|RUNNING|00:10:00|32|64G\n"
+    ))
+    with pytest.raises(ingest.InputError, match="would bill every job"):
+        ingest.register_run(ledger, "R1", "p", tmp_path / "o", ["A"], commit=COMMIT, sacct=sacct)
+    assert ledger.query("SELECT * FROM pipeline_runs") == []
+    jmap = write(tmp_path / "m.csv", "job_id,sample_id\n7,A\n")
+    reg = ingest.register_run(ledger, "R1", "p", tmp_path / "o", ["A"], commit=COMMIT, sacct=sacct, job_map=jmap)
+    assert ledger.query("SELECT job_id, sample_id FROM jobs") == [("7", "A")]
+    assert "2 sacct job(s) not in the job map were left out" not in " ".join(reg.notes)
+    assert "1 sacct job(s) not in the job map were left out" in " ".join(reg.notes)
+
+
+def test_r3_run_only_keeps_every_job_and_holds_every_unfinished_one(tmp_path, ledger):
+    _r3_one_sample(tmp_path, ledger)
+    sacct = write(tmp_path / "s.txt", (
+        "JobID|JobIDRaw|State|Elapsed|AllocCPUS|ReqMem\n"
+        "7|7|COMPLETED|01:00:00|2|4G\n"
+        "8|8|RUNNING|00:10:00|2|4G\n"
+    ))
+    jmap = write(tmp_path / "m.csv", "job_id,sample_id\n7,A\n")
+    with pytest.raises(ingest.InputError, match=r"not finished \(8\)"):
+        ingest.register_run(ledger, "R1", "p", tmp_path / "o", ["A"], commit=COMMIT, sacct=sacct, job_map=jmap,
+                            sacct_run_only=True)
+
+
+def test_r3_cached_task_of_a_resumed_run_is_left_out(tmp_path, ledger):
+    write(tmp_path / "i.csv", "sample_id,project_id\nA,P1\n")
+    ingest.intake(ledger, tmp_path / "i.csv")
+    write(tmp_path / "o1" / "A.txt", "a")
+    write(tmp_path / "o2" / "A.txt", "a2")
+    sacct = write(tmp_path / "s.txt", (
+        "JobID|JobIDRaw|State|Elapsed|AllocCPUS|ReqMem\n"
+        "40|40|COMPLETED|01:00:00|2|4G\n"
+        "41|41|COMPLETED|00:30:00|2|4G\n"
+    ))
+    first = write(tmp_path / "t1.txt", "native_id\tname\tstatus\n40\tP (A)\tCOMPLETED\n")
+    ingest.register_run(ledger, "R1", "p", tmp_path / "o1", ["A"], commit=COMMIT, sacct=sacct, trace=first)
+    resumed = write(tmp_path / "t2.txt", "native_id\tname\tstatus\n40\tP (A)\tCACHED\n41\tQ (A)\tCOMPLETED\n")
+    reg = ingest.register_run(ledger, "R2", "p", tmp_path / "o2", ["A"], commit=COMMIT, sacct=sacct, trace=resumed)
+    assert ledger.query("SELECT job_id, prun_id FROM jobs ORDER BY job_id") == [("40", "R1"), ("41", "R2")]
+    assert "Slurm job 40 is a cached task already recorded for R1; left out" in reg.notes
+    write(tmp_path / "o3" / "A.txt", "a3")
+    live = write(tmp_path / "t3.txt", "native_id\tname\tstatus\n41\tQ (A)\tCOMPLETED\n")
+    with pytest.raises(ingest.InputError, match="already recorded for pipeline run R2"):
+        ingest.register_run(ledger, "R3", "p", tmp_path / "o3", ["A"], commit=COMMIT, sacct=sacct, trace=live)
+
+
+def test_r3_gate_report_that_is_not_json(tmp_path, ledger):
+    _r3_one_sample(tmp_path, ledger)
+    gate = write(tmp_path / "g.json", "{not json")
+    with pytest.raises(ingest.InputError, match="not valid JSON"):
+        ingest.register_run(ledger, "R1", "p", tmp_path / "o", ["A"], commit=COMMIT, gate=gate)
+
+
+def test_r3_cli_reports_a_duplicate_lane_without_a_traceback(tmp_path, capsys):
+    dbp = str(tmp_path / "c.sqlite")
+    write(tmp_path / "i.csv", "sample_id,project_id\nA,P1\n")
+    write(tmp_path / "l.csv", "sample_id,run_id,lane,reads\nA,RUN1,1,10\nA,RUN1,1,12\n")
+    assert main(["init", dbp]) == 0
+    assert main(["intake", dbp, str(tmp_path / "i.csv")]) == 0
+    assert main(["sequencing", dbp, str(tmp_path / "l.csv")]) == 2
+    assert "the catalogue refused the change, so nothing was written" in capsys.readouterr().err
+    assert db.connect(dbp).query("SELECT * FROM sample_runs") == []
