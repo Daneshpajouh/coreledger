@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "coreledger"
+version = "0.1.0"
+description = "Sample-to-result records, provenance audits, run SOPs and Slurm cost recovery for a sequencing or analysis core."
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "Amirhossein Daneshpajouh" }]
+requires-python = ">=3.9"
+dependencies = []
+keywords = ["bioinformatics", "core facility", "provenance", "slurm", "cost recovery", "nextflow", "snakemake"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: POSIX",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
+
+[project.scripts]
+coreledger = "coreledger.cli:main"
+
+[project.optional-dependencies]
+postgres = ["psycopg>=3.1"]
+test = ["pytest>=7"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B"]

@@ -1,0 +1,324 @@
+"""Sample intake, sequencing runs, and pipeline runs with their results, jobs and gate report."""
+
+import csv
+import datetime as dt
+import hashlib
+import json
+import os
+import re
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Sequence
+
+from . import slurm
+from .db import Ledger
+
+ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+SEPARATORS = "._-"
+
+
+class InputError(ValueError):
+    """A sheet or file that cannot go into the catalogue as it is."""
+
+
+def _rows(path: Path, required: Sequence[str]) -> List[Dict[str, str]]:
+    with open(path, newline="") as fh:
+        reader = csv.DictReader(fh)
+        missing = [c for c in required if c not in (reader.fieldnames or [])]
+        if missing:
+            raise InputError(f"{path}: missing column(s) {', '.join(missing)}")
+        rows = []
+        for n, row in enumerate(reader, start=2):
+            clean = {k: (v or "").strip() for k, v in row.items() if k is not None}
+            for c in required:
+                if not clean[c]:
+                    raise InputError(f"{path} line {n}: {c} is empty")
+            clean["_line"] = str(n)
+            rows.append(clean)
+    return rows
+
+
+def _check_id(value: str, what: str, where: str) -> None:
+    if not ID_RE.match(value):
+        raise InputError(f"{where}: {what} {value!r} must start with a letter or digit and use only A-Z, 0-9, . _ -")
+
+
+def intake(ledger: Ledger, path: Path) -> int:
+    """Add samples from a CSV with columns sample_id and project_id (external_id, material, received optional).
+
+    The whole sheet is refused if any line is wrong, including a sample ID that is already
+    in the catalogue or repeated in the sheet.
+    """
+    rows = _rows(path, ("sample_id", "project_id"))
+    seen = set()
+    for row in rows:
+        where = f"{path} line {row['_line']}"
+        _check_id(row["sample_id"], "sample_id", where)
+        _check_id(row["project_id"], "project_id", where)
+        if row["sample_id"] in seen:
+            raise InputError(f"{where}: sample {row['sample_id']} appears twice in the sheet")
+        seen.add(row["sample_id"])
+        if ledger.one("SELECT 1 FROM samples WHERE sample_id = ?", (row["sample_id"],)):
+            raise InputError(f"{where}: sample {row['sample_id']} is already in the catalogue")
+        received = row.get("received", "")
+        if received:
+            try:
+                dt.date.fromisoformat(received)
+            except ValueError as exc:
+                raise InputError(f"{where}: received {received!r} is not a date (YYYY-MM-DD)") from exc
+    try:
+        for row in rows:
+            ledger.execute(
+                "INSERT INTO projects (project_id) VALUES (?) ON CONFLICT (project_id) DO NOTHING",
+                (row["project_id"],),
+            )
+            ledger.execute(
+                "INSERT INTO samples (sample_id, project_id, external_id, material, received) VALUES (?, ?, ?, ?, ?)",
+                (
+                    row["sample_id"],
+                    row["project_id"],
+                    row.get("external_id") or None,
+                    row.get("material") or None,
+                    row.get("received") or None,
+                ),
+            )
+        ledger.commit()
+    except Exception:
+        ledger.rollback()
+        raise
+    return len(rows)
+
+
+def add_sequencing(ledger: Ledger, path: Path) -> int:
+    """Add sample lanes from a CSV with sample_id, run_id, lane, reads (instrument, flowcell, run_date optional)."""
+    rows = _rows(path, ("sample_id", "run_id", "lane"))
+    for row in rows:
+        where = f"{path} line {row['_line']}"
+        if not ledger.one("SELECT 1 FROM samples WHERE sample_id = ?", (row["sample_id"],)):
+            raise InputError(f"{where}: sample {row['sample_id']} is not in the catalogue; add it by intake first")
+        _check_id(row["run_id"], "run_id", where)
+        if row.get("reads") and not row["reads"].isdigit():
+            raise InputError(f"{where}: reads {row['reads']!r} is not a whole number")
+    try:
+        for row in rows:
+            ledger.execute(
+                "INSERT INTO seq_runs (run_id, instrument, flowcell, run_date) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT (run_id) DO NOTHING",
+                (
+                    row["run_id"],
+                    row.get("instrument") or None,
+                    row.get("flowcell") or None,
+                    row.get("run_date") or None,
+                ),
+            )
+            ledger.execute(
+                "INSERT INTO sample_runs (sample_id, run_id, lane, reads) VALUES (?, ?, ?, ?)",
+                (row["sample_id"], row["run_id"], row["lane"], int(row["reads"]) if row.get("reads") else None),
+            )
+        ledger.commit()
+    except Exception:
+        ledger.rollback()
+        raise
+    return len(rows)
+
+
+def sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for block in iter(lambda: fh.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def match_sample(text: str, samples: Iterable[str]) -> Optional[str]:
+    """The sample whose ID starts ``text`` followed by a separator or the end; the longest wins."""
+    best = None
+    for s in samples:
+        if text == s or (text.startswith(s) and text[len(s)] in SEPARATORS):
+            if best is None or len(s) > len(best):
+                best = s
+    return best
+
+
+def sample_for_path(rel: str, samples: Sequence[str]) -> Optional[str]:
+    """The one sample a result path names, in a folder or the file name; None if none or more than one."""
+    found = set()
+    for part in Path(rel).parts:
+        hit = match_sample(part, samples)
+        if hit:
+            found.add(hit)
+    return found.pop() if len(found) == 1 else None
+
+
+@dataclass
+class Registered:
+    prun_id: str
+    results: int = 0
+    per_sample: int = 0
+    jobs: int = 0
+    jobs_per_sample: int = 0
+    notes: List[str] = field(default_factory=list)
+
+
+def read_samplesheet(path: Path) -> List[str]:
+    """Sample IDs from an nf-core style samplesheet (column ``sample``), in first-seen order."""
+    with open(path, newline="") as fh:
+        reader = csv.DictReader(fh)
+        if "sample" not in (reader.fieldnames or []):
+            raise InputError(f"{path}: a samplesheet needs a 'sample' column")
+        out: List[str] = []
+        for row in reader:
+            s = (row["sample"] or "").strip()
+            if s and s not in out:
+                out.append(s)
+    return out
+
+
+def register_run(
+    ledger: Ledger,
+    prun_id: str,
+    pipeline: str,
+    outdir: Path,
+    samples: Sequence[str],
+    version: Optional[str] = None,
+    commit: Optional[str] = None,
+    profile: Optional[str] = None,
+    params: Optional[Path] = None,
+    sacct: Optional[Path] = None,
+    trace: Optional[Path] = None,
+    job_map: Optional[Path] = None,
+    gate: Optional[Path] = None,
+    exclude: Sequence[str] = ("pipeline_info",),
+    today: Optional[str] = None,
+) -> Registered:
+    """Record one pipeline run: its samples, every result file with its hash, its Slurm jobs and its gate."""
+    _check_id(prun_id, "pipeline run ID", "register")
+    if ledger.one("SELECT 1 FROM pipeline_runs WHERE prun_id = ?", (prun_id,)):
+        raise InputError(f"pipeline run {prun_id} is already registered")
+    outdir = Path(outdir)
+    if not outdir.is_dir():
+        raise InputError(f"{outdir} is not a folder")
+    if not samples:
+        raise InputError("a pipeline run needs at least one sample")
+    unknown = [s for s in samples if not ledger.one("SELECT 1 FROM samples WHERE sample_id = ?", (s,))]
+    if unknown:
+        raise InputError(f"not in the catalogue: {', '.join(unknown)}; add them by intake first")
+    if commit is not None and not re.fullmatch(r"[0-9a-f]{40}", commit):
+        raise InputError(f"commit {commit!r} is not a full 40-character git commit hash")
+
+    reg = Registered(prun_id)
+    gate_verdict = gate_cfg = gate_path = None
+    if gate is not None:
+        report = json.loads(Path(gate).read_text())
+        gate_verdict = report.get("verdict")
+        if gate_verdict not in ("PASS", "FAIL", "ERROR"):
+            raise InputError(f"{gate}: no verdict PASS, FAIL or ERROR in the gate report")
+        gate_cfg = report.get("config_sha256")
+        gate_path = str(Path(gate).resolve())
+
+    files = []
+    for root, dirs, names in os.walk(outdir):
+        dirs[:] = sorted(d for d in dirs if d not in exclude)
+        for name in sorted(names):
+            p = Path(root) / name
+            if p.is_symlink() or not p.is_file():
+                continue
+            files.append(p)
+
+    jobs: List[slurm.Job] = []
+    tags: Dict[str, str] = {}
+    if sacct is not None:
+        jobs, notes = slurm.read_sacct(sacct)
+        reg.notes.extend(notes)
+    if trace is not None:
+        tags = slurm.read_nextflow_trace(trace)
+        kept = [j for j in jobs if j.job_id in tags or j.alt_id in tags]
+        if sacct is not None and len(kept) != len(jobs):
+            reg.notes.append(f"{len(jobs) - len(kept)} sacct job(s) not in the trace were left out")
+        listed = {j.job_id for j in kept} | {j.alt_id for j in kept}
+        missing = sorted(set(tags) - listed)
+        if sacct is not None and missing:
+            reg.notes.append(f"{len(missing)} trace job(s) not found in sacct: {', '.join(missing[:5])}")
+        jobs = kept
+    mapped: Dict[str, str] = {}
+    if job_map is not None:
+        for row in _rows(job_map, ("job_id", "sample_id")):
+            if row["sample_id"] not in samples:
+                raise InputError(f"{job_map} line {row['_line']}: sample {row['sample_id']} is not in this run")
+            mapped[row["job_id"]] = row["sample_id"]
+
+    try:
+        ledger.execute(
+            "INSERT INTO pipeline_runs (prun_id, pipeline, version, commit_sha, profile, params_sha256, outdir, "
+            "registered, gate_report, gate_verdict, gate_config_sha256) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                prun_id,
+                pipeline,
+                version,
+                commit,
+                profile,
+                sha256_file(params) if params else None,
+                str(outdir.resolve()),
+                today or dt.date.today().isoformat(),
+                gate_path,
+                gate_verdict,
+                gate_cfg,
+            ),
+        )
+        ledger.executemany(
+            "INSERT INTO prun_samples (prun_id, sample_id) VALUES (?, ?)", [(prun_id, s) for s in samples]
+        )
+        for p in files:
+            rel = p.relative_to(outdir).as_posix()
+            sample = sample_for_path(rel, samples)
+            ledger.execute(
+                "INSERT INTO results (prun_id, path, sample_id, sha256, bytes) VALUES (?, ?, ?, ?, ?)",
+                (prun_id, rel, sample, sha256_file(p), p.stat().st_size),
+            )
+            reg.results += 1
+            reg.per_sample += sample is not None
+        for j in jobs:
+            sample = mapped.get(j.job_id) or mapped.get(j.alt_id)
+            if sample is None and tags:
+                tag = tags.get(j.job_id) or tags.get(j.alt_id) or ""
+                sample = match_sample(tag, samples) if tag else None
+            if ledger.one("SELECT prun_id FROM jobs WHERE job_id = ?", (j.job_id,)):
+                raise InputError(f"Slurm job {j.job_id} is already recorded for another pipeline run")
+            ledger.execute(
+                "INSERT INTO jobs (job_id, prun_id, name, tag, state, elapsed_s, alloc_cpus, req_mem_bytes, gpus, "
+                "sample_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    j.job_id,
+                    prun_id,
+                    j.name or None,
+                    tags.get(j.job_id) or tags.get(j.alt_id) or None,
+                    j.state or None,
+                    j.elapsed_s,
+                    j.alloc_cpus,
+                    j.req_mem_bytes,
+                    j.gpus,
+                    sample,
+                ),
+            )
+            reg.jobs += 1
+            reg.jobs_per_sample += sample is not None
+        ledger.commit()
+    except Exception:
+        ledger.rollback()
+        raise
+    return reg
+
+
+def release(ledger: Ledger, prun_id: str, force: bool = False, today: Optional[str] = None) -> None:
+    """Mark a pipeline run's results as released; refused unless its gate passed, or ``force``."""
+    row = ledger.one("SELECT gate_verdict, released FROM pipeline_runs WHERE prun_id = ?", (prun_id,))
+    if row is None:
+        raise InputError(f"no pipeline run {prun_id}")
+    if row[1]:
+        raise InputError(f"pipeline run {prun_id} was released on {row[1]}")
+    if row[0] != "PASS" and not force:
+        raise InputError(f"pipeline run {prun_id} has gate verdict {row[0] or 'none'}; release refused (see --force)")
+    ledger.execute(
+        "UPDATE pipeline_runs SET released = ? WHERE prun_id = ?", (today or dt.date.today().isoformat(), prun_id)
+    )
+    ledger.commit()
