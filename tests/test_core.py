@@ -561,6 +561,7 @@ def test_r2_illumina_name_and_numeric_sample_stay_with_their_sample():
     assert ingest.sample_for_path("fastqc/KO_REP1_1_fastqc.html", ["KO_REP1", "1"]) == "KO_REP1"
     assert ingest.sample_for_path("de/KO_REP1-vs-WT_REP1.tsv", ["KO_REP1", "WT_REP1"]) is None
     assert ingest.sample_for_path("de/KO_REP1.vs.WT_REP1.tsv", ["KO_REP1", "WT_REP1"]) is None
+    assert ingest.sample_for_path("qc/S1_vs_S1.tsv", ["S1", "S10"]) == "S1"
 
 
 def test_r2_broken_link_is_refused(tmp_path, ledger):
@@ -585,6 +586,9 @@ def test_r2_unfinished_jobs_of_the_run_are_refused(tmp_path, ledger, state):
     trace = write(tmp_path / "t.txt", "native_id\tname\n300_1\tP (A)\n")
     with pytest.raises(ingest.InputError, match="have not finished"):
         ingest.register_run(ledger, "R1", "p", tmp_path / "o", ["A"], commit=COMMIT, sacct=sacct, trace=trace)
+    plain = write(tmp_path / "p.txt", f"JobID|JobIDRaw|State|Elapsed|AllocCPUS|ReqMem\n7|7|{state}|00:00:00|2|4G\n")
+    with pytest.raises(ingest.InputError, match=r"not finished \(7\)"):
+        ingest.register_run(ledger, "R1", "p", tmp_path / "o", ["A"], commit=COMMIT, sacct=plain)
 
 
 def test_r2_cancelled_range_and_other_users_running_job_are_not_refused(tmp_path, ledger):
