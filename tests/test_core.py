@@ -580,13 +580,14 @@ def test_r2_unfinished_jobs_of_the_run_are_refused(tmp_path, ledger, state):
     write(tmp_path / "i.csv", "sample_id,project_id\nA,P1\n")
     ingest.intake(ledger, tmp_path / "i.csv")
     write(tmp_path / "o" / "A.txt", "a")
-    sacct = write(tmp_path / "s.txt", f"JobID|JobIDRaw|State|Elapsed|AllocCPUS|ReqMem\n300_[3-10]|300|{state}|00:00:00|0|4G\n")
+    head = "JobID|JobIDRaw|State|Elapsed|AllocCPUS|ReqMem\n"
+    sacct = write(tmp_path / "s.txt", f"{head}300_[3-10]|300|{state}|00:00:00|0|4G\n")
     with pytest.raises(ingest.InputError, match="have not finished"):
         ingest.register_run(ledger, "R1", "p", tmp_path / "o", ["A"], commit=COMMIT, sacct=sacct)
     trace = write(tmp_path / "t.txt", "native_id\tname\n300_1\tP (A)\n")
     with pytest.raises(ingest.InputError, match="have not finished"):
         ingest.register_run(ledger, "R1", "p", tmp_path / "o", ["A"], commit=COMMIT, sacct=sacct, trace=trace)
-    plain = write(tmp_path / "p.txt", f"JobID|JobIDRaw|State|Elapsed|AllocCPUS|ReqMem\n7|7|{state}|00:00:00|2|4G\n")
+    plain = write(tmp_path / "p.txt", f"{head}7|7|{state}|00:00:00|2|4G\n")
     with pytest.raises(ingest.InputError, match=r"not finished \(7\)"):
         ingest.register_run(ledger, "R1", "p", tmp_path / "o", ["A"], commit=COMMIT, sacct=plain)
 
@@ -624,7 +625,8 @@ def test_r2_folders_naming_two_samples_are_noted(tmp_path, ledger):
     write(tmp_path / "o" / "WT_REP1" / "KO_REP1" / "quant.sf", "q")
     write(tmp_path / "o" / "de" / "KO_REP1_vs_WT_REP1.tsv", "d")
     reg = ingest.register_run(ledger, "R1", "p", tmp_path / "o", ["WT_REP1", "KO_REP1"], commit=COMMIT)
-    assert "1 result(s) in folders that name two samples were recorded for the run: WT_REP1/KO_REP1/quant.sf" in reg.notes
+    note = "1 result(s) in folders that name two samples were recorded for the run: WT_REP1/KO_REP1/quant.sf"
+    assert note in reg.notes
 
 
 def test_r2_contrast_job_tag_is_shared(tmp_path, ledger):
