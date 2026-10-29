@@ -234,8 +234,9 @@ def _left_out(folder: Path, inner: Sequence[Path]) -> List[str]:
     return rest
 
 
-def _walk_results(outdir: Path, exclude: Sequence[str]) -> Tuple[List[Path], List[str], List[str]]:
-    """The result files under ``outdir``, the linked folders entered and the links not entered.
+def _walk_results(outdir: Path, exclude: Sequence[str]) -> Tuple[List[Path], List[str], List[str], List[str]]:
+    """The result files under ``outdir``, the linked folders entered, the links not entered and the file links
+    left out.
 
     Linked folders are entered (nf-core publishDir mode symlink). A link is not entered when it
     points back to a folder already on the way down, so a loop ends; into the results folder,
@@ -245,7 +246,9 @@ def _walk_results(outdir: Path, exclude: Sequence[str]) -> Tuple[List[Path], Lis
     A link that holds another target and other files or linked folders too is refused, since entering it would
     record other tasks' files and skipping it would leave files out. A plain folder is always
     entered. Only links in the results folder itself count as targets, so the outcome does not
-    depend on the order of names.
+    depend on the order of names. Inside a linked folder, a link to a file outside that folder is
+    left out too, for the same reason: it is a task's staged input (round 9, Reviewer B); a file
+    link in a plain folder is recorded, as nf-core publishDir mode symlink needs.
     """
     top = outdir.resolve()
     targets: Set[Path] = set()
@@ -256,6 +259,7 @@ def _walk_results(outdir: Path, exclude: Sequence[str]) -> Tuple[List[Path], Lis
     files: List[Path] = []
     linked: List[str] = []
     loops: List[str] = []
+    staged: List[str] = []
     above = {outdir: frozenset({top})}
     store: Dict[Path, Optional[Path]] = {outdir: None}
     for root, dirs, names in os.walk(outdir, followlinks=True):
@@ -293,11 +297,14 @@ def _walk_results(outdir: Path, exclude: Sequence[str]) -> Tuple[List[Path], Lis
         dirs[:] = kept
         for name in sorted(names):
             p = Path(root) / name
+            if inside is not None and p.is_symlink() and p.is_file() and not p.resolve().is_relative_to(inside):
+                staged.append(p.relative_to(outdir).as_posix())
+                continue
             if p.is_file():
                 files.append(p)
             elif p.is_symlink():
                 raise InputError(f"{p} is a link that does not point at a file; the result it stood for is gone")
-    return files, linked, loops
+    return files, linked, loops, staged
 
 def register_run(
     ledger: Ledger,
@@ -357,13 +364,16 @@ def register_run(
         gate_cfg = report.get("config_sha256")
         gate_path = str(Path(gate).resolve())
 
-    files, linked_dirs, loops = _walk_results(outdir, exclude)
+    files, linked_dirs, loops, staged = _walk_results(outdir, exclude)
     if linked_dirs:
         reg.notes.append(f"{len(linked_dirs)} linked folder(s) entered: {', '.join(linked_dirs[:5])}")
     if loops:
         reg.notes.append(f"{len(loops)} linked folder(s) not entered (a loop, a folder inside the results, "
                          "a folder that holds the results or another linked folder, or a link out of a linked "
                          f"folder): {', '.join(loops[:5])}")
+    if staged:
+        reg.notes.append(f"{len(staged)} link(s) to a file outside its linked folder not recorded (a task's staged "
+                         f"input): {', '.join(staged[:5])}")
 
     jobs: List[slurm.Job] = []
     tags: Dict[str, str] = {}
@@ -395,6 +405,11 @@ def register_run(
             if j.job_id in ours or j.alt_id in ours:
                 bases |= {i.split("_")[0] for i in (j.job_id, j.alt_id) if i}
         for ids in held:
+            if any(i in ours for i in ids if i):
+                bases |= {i.split("_")[0] for i in ids if i}
+        # A zero-time task of the run ties its array too (round 9, Reviewer B: 300_1 cancelled at no time, with
+        # 300_[2-10] pending, registered with the pending range never billed).
+        for ids in zero:
             if any(i in ours for i in ids if i):
                 bases |= {i.split("_")[0] for i in ids if i}
         held = [(s, r) for s, r in held if (s or r).split("_")[0] in bases]

@@ -1164,3 +1164,37 @@ def test_r8_a_zero_time_blank_line_is_not_reported_missing(tmp_path, ledger, lis
     assert [r[0] for r in ledger.query("SELECT job_id FROM jobs")] == ["101"]
     assert "job 909 skipped: AllocCPUS is empty and it ran for no time" in reg.notes
     assert not [n for n in reg.notes if "not found in sacct" in n]
+
+
+def test_r9_a_zero_time_task_ties_its_pending_array_range(tmp_path, ledger):
+    # Round 9, Reviewer B MEDIUM: a cancelled zero-time task with a blank size did not tie its array, so the pending
+    # range of the run's own array was not "not finished" and the run registered with that time never billed.
+    _r3_one_sample(tmp_path, ledger)
+    sacct = write(tmp_path / "s.txt", (
+        "JobID|JobIDRaw|State|Elapsed|AllocCPUS|ReqMem\n"
+        "300_1|301|CANCELLED|00:00:00||\n"
+        "300_[2-10]|300|PENDING|00:00:00||\n"
+    ))
+    trace = write(tmp_path / "t.txt", "native_id\tname\n301\tP (A)\n")
+    with pytest.raises(ingest.InputError, match=r"^1 Slurm job\(s\) of this run have not finished \(300_\[2-10\]\)"):
+        ingest.register_run(ledger, "R1", "p", tmp_path / "o", ["A"], commit=COMMIT, sacct=sacct, trace=trace)
+    assert ledger.one("SELECT COUNT(*) FROM pipeline_runs")[0] == 0
+
+
+def test_r9_a_file_link_out_of_a_linked_folder_is_not_recorded(tmp_path, ledger):
+    # Round 9, Reviewer B MEDIUM: only folder links out of a linked folder were left out, so a task's staged fastq
+    # was hashed as a result. A file link in a plain results folder is still recorded.
+    _r3_one_sample(tmp_path, ledger)
+    store = tmp_path / "ext" / "A"
+    write(store / "a.txt", "a")
+    write(tmp_path / "ext" / "reads" / "A.fastq", "reads")
+    (store / "A.fastq").symlink_to(tmp_path / "ext" / "reads" / "A.fastq")
+    write(tmp_path / "pub" / "A.bam", "bam A")
+    out = tmp_path / "o"
+    (out / "A_store").symlink_to(store)
+    (out / "A.bam").symlink_to(tmp_path / "pub" / "A.bam")
+    reg = ingest.register_run(ledger, "R1", "p", out, ["A"], commit=COMMIT)
+    paths = [r[0] for r in ledger.query("SELECT path FROM results ORDER BY path")]
+    assert paths == ["A.bam", "A.txt", "A_store/a.txt"]
+    assert "1 link(s) to a file outside its linked folder not recorded (a task's staged input): A_store/A.fastq" \
+        in reg.notes
