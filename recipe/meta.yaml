@@ -8,7 +8,7 @@ package:
 source:
   url: https://pypi.org/packages/source/{{ name[0] }}/{{ name }}/{{ name }}-{{ version }}.tar.gz
   # The sdist is rewritten by tools/normalize_sdist.py, so any rebuild of this release gives this hash.
-  sha256: f9345cb29217be864ac7e3b626480a2c5e979f4f309debac99da5571f65f16ee
+  sha256: 0c101dcec2e4d060e642cb48cf668eb42ad757e968d7672f26e860e6a19511b5
 
 build:
   number: 0
