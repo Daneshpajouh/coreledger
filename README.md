@@ -4,7 +4,7 @@ coreledger keeps the records a sequencing or analysis core needs behind each del
 
 It does four things:
 
-- `intake`, `sequencing` and `register` record samples, lanes, and finished pipeline runs with a SHA-256 for every result file, the Slurm jobs from `sacct`, and the gate report from [tolgate](https://github.com/Daneshpajouh/tolgate) or any JSON with a PASS, FAIL or ERROR verdict.
+- `intake`, `sequencing` and `register` record samples, lanes, and finished pipeline runs with a SHA-256 for every result file, the Slurm jobs from `sacct`, and the gate report from tolgate (a separate tool, not yet public) or any JSON with a PASS, FAIL or ERROR verdict.
 - `audit` checks that every result can be traced and that nothing was released that should not have been, and exits 1 on any error, so it can gate a delivery script.
 - `bill` prices the recorded jobs with a rate card and shares the cost out to samples, with sample lines that always add up to the project total.
 - `sop` drafts a standard operating procedure from a pipeline's parameter schema and the core's own params file, and lists what a release upgrade changes.
